@@ -371,6 +371,9 @@ Incrementally merge live network policy changes into the current sandbox policy.
 Notes:
 
 - The sandbox name defaults to the last-used sandbox.
+- `protocol` accepts `tcp` for explicit L4-only host/port policy. It is
+  currently equivalent to omitting the protocol and cannot be combined with
+  `access`, `rules`, or L7 enforcement options.
 - `--add-allow` and `--add-deny` operate on REST and WebSocket endpoints. Use full YAML for JSON-RPC, MCP, SQL, or other policy structure.
 - `--wait` cannot be combined with `--dry-run`.
 - Use `policy set` when replacing the full policy or changing static sections.
