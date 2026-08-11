@@ -72,9 +72,16 @@ its guarded single-request relay while sharing authorization, request context,
 policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
 Policy authors may use `protocol: tcp` as an explicit spelling of the existing
-L4 passthrough behavior. Omitting `protocol` remains equivalent. The egress
-intent reserves a transparent TCP adapter and a policy-DNS-pinned address, but
-DNS serving and transparent TCP capture are not active yet.
+L4 passthrough behavior. Omitting `protocol` remains equivalent. The network
+supervisor contains a dormant policy-DNS boundary for explicit TCP endpoints:
+it snapshots eligible endpoint identities from one policy generation, resolves
+eligible names only through an explicitly supplied trusted resolver, filters
+answers through the shared destination controls, and publishes expiring
+synthetic-address mappings with separate mapping generations. Refreshes retain
+their synthetic identity, and policy reload, expiry, wrong ports, missing
+mappings, or pool exhaustion fail closed. The pinned connector never resolves
+the name again. No DNS listener is exposed to workloads, resolver configuration
+is not injected, and transparent TCP capture is not active in this increment.
 
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static
