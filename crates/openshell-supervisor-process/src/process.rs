@@ -15,8 +15,10 @@ use nix::unistd::{Gid, Group, Pid, Uid, User};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use std::collections::HashMap;
 use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{OwnedFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -27,7 +29,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::{debug, info};
 
 /// Process/filesystem enforcement performed by the process supervisor.
@@ -545,6 +547,18 @@ fn mount_empty_tmpfs(target: &CString) -> std::io::Result<()> {
 pub struct ProcessHandle {
     child: Child,
     pid: u32,
+    io: Option<ProcessIo>,
+}
+
+/// Supervisor-owned canonical-process I/O. These handles outlive individual
+/// SSH attachments and are consumed by the main-session multiplexer.
+pub enum ProcessIo {
+    Pty(std::fs::File),
+    Pipes {
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+    },
 }
 
 impl ProcessHandle {
@@ -559,6 +573,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
+        main_workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -571,6 +586,7 @@ impl ProcessHandle {
             program,
             args,
             workspace,
+            main_workdir,
             interactive,
             policy,
             resolved_identity,
@@ -592,6 +608,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
+        main_workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -603,6 +620,7 @@ impl ProcessHandle {
             program,
             args,
             workspace,
+            main_workdir,
             interactive,
             policy,
             resolved_identity,
@@ -618,6 +636,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
+        main_workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -628,11 +647,31 @@ impl ProcessHandle {
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
         cmd.args(args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
+
+        let mut pty_master = None;
+        let mut terminal_slave_fd = None;
+        if interactive {
+            let winsize = nix::pty::Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let pty = nix::pty::openpty(Some(&winsize), None).into_diagnostic()?;
+            let master = std::fs::File::from(pty.master);
+            let slave = std::fs::File::from(pty.slave);
+            terminal_slave_fd = Some(slave.as_raw_fd());
+            cmd.stdin(slave.try_clone().into_diagnostic()?)
+                .stdout(slave.try_clone().into_diagnostic()?)
+                .stderr(slave);
+            pty_master = Some(master);
+        } else {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
 
         // Strip supervisor-only identity material from the entrypoint's
         // inherited environment. The entrypoint drops to the sandbox user
@@ -642,7 +681,7 @@ impl ProcessHandle {
 
         inject_provider_env(&mut cmd, provider_env);
 
-        if let Some(dir) = workspace.root() {
+        if let Some(dir) = main_workdir.or_else(|| workspace.root()) {
             cmd.current_dir(dir);
         }
         if let Some(home) = workspace.home() {
@@ -719,9 +758,18 @@ impl ProcessHandle {
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
-                    if !interactive {
-                        // Create new process group
-                        libc::setpgid(0, 0);
+                    if let Some(slave_fd) = terminal_slave_fd {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    } else {
+                        // Create a distinct process group for signal forwarding.
+                        if libc::setpgid(0, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
 
                     // Enter network namespace before applying other restrictions
@@ -761,13 +809,27 @@ impl ProcessHandle {
             }
         }
 
-        let child = cmd.spawn().into_diagnostic()?;
+        let mut child = cmd.spawn().into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
         managed_children::register(pid);
 
+        let io = if let Some(master) = pty_master {
+            ProcessIo::Pty(master)
+        } else {
+            ProcessIo::Pipes {
+                stdin: child.stdin.take().expect("canonical stdin must be piped"),
+                stdout: child.stdout.take().expect("canonical stdout must be piped"),
+                stderr: child.stderr.take().expect("canonical stderr must be piped"),
+            }
+        };
+
         debug!(pid, program, "Process spawned");
 
-        Ok(Self { child, pid })
+        Ok(Self {
+            child,
+            pid,
+            io: Some(io),
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -776,6 +838,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
+        main_workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -785,11 +848,33 @@ impl ProcessHandle {
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
         cmd.args(args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
+
+        let mut pty_master = None;
+        let mut terminal_slave_fd = None;
+        #[cfg(unix)]
+        if interactive {
+            let winsize = nix::pty::Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let pty = nix::pty::openpty(Some(&winsize), None).into_diagnostic()?;
+            let master = std::fs::File::from(pty.master);
+            let slave = std::fs::File::from(pty.slave);
+            terminal_slave_fd = Some(slave.as_raw_fd());
+            cmd.stdin(slave.try_clone().into_diagnostic()?)
+                .stdout(slave.try_clone().into_diagnostic()?)
+                .stderr(slave);
+            pty_master = Some(master);
+        }
+        if !interactive {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
 
         // Strip supervisor-only identity material from the entrypoint's
         // inherited environment.
@@ -797,7 +882,7 @@ impl ProcessHandle {
 
         inject_provider_env(&mut cmd, provider_env);
 
-        if let Some(dir) = workspace.root() {
+        if let Some(dir) = main_workdir.or_else(|| workspace.root()) {
             cmd.current_dir(dir);
         }
         if let Some(home) = workspace.home() {
@@ -825,9 +910,9 @@ impl ProcessHandle {
             }
         }
 
-        // Set up process group for signal handling (non-interactive mode only).
-        // In interactive mode, we inherit the parent's process group to maintain
-        // proper terminal control for shells and interactive programs.
+        // Create a dedicated session for PTY children and a dedicated process
+        // group for pipe children so attachment signals target only the
+        // canonical workload tree.
         // SAFETY: pre_exec runs after fork but before exec in the child process.
         // setpgid is async-signal-safe and safe to call in this context.
         #[cfg(unix)]
@@ -837,9 +922,17 @@ impl ProcessHandle {
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
-                    if !interactive {
-                        // Create new process group
-                        libc::setpgid(0, 0);
+                    if let Some(slave_fd) = terminal_slave_fd {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    } else {
+                        if libc::setpgid(0, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
 
                     // Drop privileges before applying sandbox restrictions.
@@ -862,20 +955,39 @@ impl ProcessHandle {
             }
         }
 
-        let child = cmd.spawn().into_diagnostic()?;
+        let mut child = cmd.spawn().into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
         #[cfg(target_os = "linux")]
         managed_children::register(pid);
 
         debug!(pid, program, "Process spawned");
 
-        Ok(Self { child, pid })
+        let io = if let Some(master) = pty_master {
+            ProcessIo::Pty(master)
+        } else {
+            ProcessIo::Pipes {
+                stdin: child.stdin.take().expect("canonical stdin must be piped"),
+                stdout: child.stdout.take().expect("canonical stdout must be piped"),
+                stderr: child.stderr.take().expect("canonical stderr must be piped"),
+            }
+        };
+
+        Ok(Self {
+            child,
+            pid,
+            io: Some(io),
+        })
     }
 
     /// Get the process ID.
     #[must_use]
     pub const fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Transfer retained stdio to the main-session multiplexer.
+    pub fn take_io(&mut self) -> ProcessIo {
+        self.io.take().expect("canonical process I/O already taken")
     }
 
     /// Wait for the process to exit.
@@ -889,6 +1001,16 @@ impl ProcessHandle {
         managed_children::unregister(self.pid);
         let status = status?;
         Ok(ProcessStatus::from(status))
+    }
+
+    /// Observe an already-terminated child without blocking.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ProcessStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            #[cfg(target_os = "linux")]
+            managed_children::unregister(self.pid);
+        }
+        Ok(status.map(ProcessStatus::from))
     }
 
     /// Send a signal to the process.
@@ -2150,6 +2272,12 @@ pub struct ProcessStatus {
 }
 
 impl ProcessStatus {
+    /// Get the conventional exit code when the process exited normally.
+    #[must_use]
+    pub const fn exit_code(&self) -> Option<i32> {
+        self.code
+    }
+
     /// Get the exit code, or 128 + signal number if killed by signal.
     #[must_use]
     pub fn code(&self) -> i32 {

@@ -13,6 +13,8 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 - Injecting sandbox identity and gateway callback configuration.
 - Supplying TLS or secret material for supervisor callbacks.
 - Providing the supervisor binary or image in the workload.
+- Forwarding the exact canonical main-process argv, environment, working
+  directory, and terminal mode without shell reconstruction.
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 
@@ -22,6 +24,11 @@ nothing more. Drivers must not gate on supervisor session state or hold
 references to gateway-internal types. The gateway owns the public
 `SandboxPhase::Ready` decision. This applies equally to extension drivers
 implementing `ComputeDriver` out of tree.
+
+Drivers advertise canonical-process support in `GetCapabilities`. The gateway
+rejects creation through older extension drivers that do not advertise the
+capability, preventing a legacy idle entrypoint from silently replacing the
+requested workload.
 
 Drivers own runtime-specific platform event interpretation. When an event should
 drive client provisioning UI, the driver attaches the shared

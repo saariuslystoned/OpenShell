@@ -240,6 +240,7 @@ impl ComputeDriver for FakeComputeDriver {
                 driver_name: state.driver_name.clone(),
                 driver_version: state.driver_version.clone(),
                 default_image: state.default_image.clone(),
+                supports_main_process: true,
             }
         });
         Ok(Response::new(response))

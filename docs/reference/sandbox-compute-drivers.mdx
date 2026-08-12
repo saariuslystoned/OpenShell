@@ -18,6 +18,12 @@ Delete remains independent and removes compute plus driver-owned persistent
 state. While a sandbox is stopped, gateway access paths and exposed services
 remain unavailable.
 
+The gateway forwards one exact, persisted main-process specification to every
+driver. Drivers serialize that specification in
+`OPENSHELL_MAIN_PROCESS_SPEC`; they do not install an idle `sleep` workload or
+reconstruct argv with shell parsing. Runtime restart policies are disabled so
+an exited canonical process remains a terminal sandbox error.
+
 ## Configure a Compute Driver
 
 Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set `compute_drivers` in the gateway TOML file:

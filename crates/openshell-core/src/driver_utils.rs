@@ -382,6 +382,7 @@ pub fn build_capabilities_response(
         driver_name: driver_name.to_string(),
         driver_version: driver_version.into(),
         default_image: default_image.into(),
+        supports_main_process: true,
     }
 }
 
