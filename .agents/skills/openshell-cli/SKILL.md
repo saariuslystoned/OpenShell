@@ -469,7 +469,10 @@ Docker and Podman custom images may declare an absolute OCI `WORKDIR`. Empty,
 other path, the image author must make the final OCI/policy identity able to
 traverse and write it. OpenShell validates the effective workspace before
 readiness and does not create, chown, or chmod it. Podman mounts its persistent
-named volume at that path and performs normal initial copy-up.
+named volume at that path and performs normal initial copy-up. Workdirs cannot
+overlap kernel-managed OCI mounts or the supervisor's minimal executable and
+library roots; this protects workspace mount placement, not custom-image
+integrity.
 
 ### Forward ports
 

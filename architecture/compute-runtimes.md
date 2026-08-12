@@ -210,9 +210,13 @@ The final supervisor validates non-default paths twice: a no-follow structural
 walk runs before policy, credential, TLS, or networking initialization, then a
 one-shot validator drops to the final identity and uses kernel access checks
 before workload launch. The checks reject symlinks, non-directories,
-kernel-managed filesystems, OpenShell control paths, OCI runtime mounts, and
-workspace roots that would cover essential execution or library paths. Image
-`VOLUME` declarations and driver-config mounts may not mask the workspace.
+kernel-managed filesystems, and OpenShell control paths. They also reject
+overlap in either direction with `/proc`, `/sys`, `/dev`, `/bin`, `/sbin`,
+`/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`, `/usr/lib`, or `/usr/lib64`. The
+first three are kernel-managed OCI mounts; the others protect executable and
+library roots used by the supervisor. This is a mount-placement guardrail, not
+an image-integrity guarantee. Image `VOLUME` declarations and driver-config
+mounts may not mask the workspace.
 
 Docker checks the image directory directly. Podman mounts the persistent named
 workspace volume at the resolved workdir and validates it after Podman's normal

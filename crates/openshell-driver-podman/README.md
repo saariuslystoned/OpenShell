@@ -129,11 +129,14 @@ volume is mounted at the normalized absolute workdir and Podman performs its
 normal initial copy-up.
 
 The final supervisor rejects symlink components, non-directories,
-kernel-managed filesystems, OpenShell control paths, and workspace roots that
-would cover essential execution or library paths. It then verifies that the
-final OCI/policy identity can traverse and write the mounted workspace before
-readiness. The resolved path becomes both cwd and `HOME` for direct and SSH
-children.
+kernel-managed filesystems, and OpenShell control paths. The driver also
+rejects a workdir that overlaps `/proc`, `/sys`, `/dev`, or the supervisor's
+minimal executable and library roots in either direction. This prevents
+OpenShell from placing its persistent workspace over those paths; it does not
+attempt to establish the integrity of a custom image. The supervisor then
+verifies that the final OCI/policy identity can traverse and write the mounted
+workspace before readiness. The resolved path becomes both cwd and `HOME` for
+direct and SSH children.
 
 OpenShell does not create, chown, or chmod a non-default workdir. Podman may
 initialize or adjust a named-volume mountpoint as part of its own volume

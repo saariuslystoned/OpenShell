@@ -1494,7 +1494,13 @@ mod tests {
 
     #[test]
     fn container_spec_rejects_invalid_or_protected_oci_working_dir() {
-        for working_dir in ["relative/workspace", "/usr", "/usr/bin", "/opt/openshell"] {
+        for working_dir in [
+            "relative/workspace",
+            "/usr",
+            "/usr/bin",
+            "/usr/bin/project",
+            "/opt/openshell",
+        ] {
             let error = ResolvedPodmanImage::from_inspect(
                 &image_inspect("sha256:immutable", "app:staff", working_dir),
                 &test_config(),

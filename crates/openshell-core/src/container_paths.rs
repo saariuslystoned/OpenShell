@@ -16,42 +16,26 @@ pub const SIDECAR_RUN_ROOT: &str = "/run/openshell-sidecar";
 pub const NETNS_MOUNT_ROOT: &str = "/run/netns";
 pub const NETNS_IPROUTE2_ROOT: &str = "/var/run/netns";
 
-/// Standard Linux container namespaces that an image-selected workspace must
-/// not contain or enter.
+/// Container roots that an image-selected workspace must not overlap.
 ///
-/// These roots cover the default filesystems and devices defined by the OCI
-/// Runtime Specification: procfs, sysfs, cgroups, device nodes, devpts, shared
-/// memory, and POSIX message queues.
-/// <https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#default-filesystems>
-pub const OCI_RUNTIME_MOUNT_ROOTS: &[&str] = &["/proc", "/sys", "/dev"];
-
-/// Execution and library roots that an image-selected workspace must not
-/// replace or contain.
-///
-/// Unlike control and kernel-managed paths, application directories below a
-/// system namespace remain valid workspace targets. For example, `/usr` is
-/// rejected because it contains `/usr/bin`, while `/usr/src/app` is allowed.
-pub const ESSENTIAL_SYSTEM_ROOTS: &[&str] = &[
+/// The first group contains kernel-managed mounts from the OCI runtime. The
+/// second protects executable and library roots used by the in-container
+/// supervisor. This is a narrow mount-placement guardrail, not an image
+/// integrity check; application paths such as `/usr/src/app` remain valid.
+pub const FORBIDDEN_WORKSPACE_ROOTS: &[&str] = &[
+    // Kernel-managed OCI runtime mounts.
+    "/proc",
+    "/sys",
+    "/dev",
+    // Executable and library roots needed by the supervisor.
     "/bin",
     "/sbin",
     "/lib",
-    "/lib32",
     "/lib64",
-    "/libx32",
     "/usr/bin",
     "/usr/sbin",
     "/usr/lib",
-    "/usr/lib32",
     "/usr/lib64",
-    "/usr/libx32",
-    "/usr/libexec",
-    "/usr/local/bin",
-    "/usr/local/sbin",
-    "/usr/local/lib",
-    "/usr/local/lib32",
-    "/usr/local/lib64",
-    "/usr/local/libx32",
-    "/usr/local/libexec",
 ];
 
 /// High-level namespaces mounted or created by `OpenShell` inside sandboxes.
@@ -147,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_roots_cover_standard_oci_mount_destinations() {
+    fn forbidden_workspace_roots_cover_standard_oci_mount_destinations() {
         for path in [
             "/proc",
             "/dev",
@@ -158,7 +142,7 @@ mod tests {
             "/sys/fs/cgroup",
         ] {
             assert!(
-                OCI_RUNTIME_MOUNT_ROOTS
+                FORBIDDEN_WORKSPACE_ROOTS
                     .iter()
                     .any(|root| Path::new(path).starts_with(root)),
                 "OCI runtime mount {path} is outside the reserved roots"

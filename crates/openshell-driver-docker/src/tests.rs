@@ -668,7 +668,7 @@ fn container_creation_rejects_openshell_control_path_working_dir() {
 }
 
 #[test]
-fn container_creation_protects_essential_roots_but_allows_usr_application_paths() {
+fn container_creation_protects_forbidden_roots_but_allows_usr_application_paths() {
     let rejected = DockerImageMetadata {
         id: "sha256:immutable".to_string(),
         user: "1234:1235".to_string(),
@@ -683,7 +683,7 @@ fn container_creation_protects_essential_roots_but_allows_usr_application_paths(
         &rejected,
     )
     .unwrap_err();
-    assert!(error.message().contains("essential system path"));
+    assert!(error.message().contains("forbidden workspace root"));
 
     let allowed = DockerImageMetadata {
         working_dir: "/usr/src/app".to_string(),

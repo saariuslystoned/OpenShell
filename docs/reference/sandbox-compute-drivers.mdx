@@ -456,8 +456,12 @@ parent and write and enter the effective workspace.
 
 Before loading policy, credentials, TLS, or networking state, the final
 supervisor rejects symlink components, non-directories, kernel-managed
-filesystems, OpenShell control paths, OCI runtime mounts, and workspace roots
-that would cover essential execution or library paths. Before workload launch,
+filesystems, and OpenShell control paths. The drivers reject overlap in either
+direction with `/proc`, `/sys`, `/dev`, `/bin`, `/sbin`, `/usr/bin`,
+`/usr/sbin`, `/lib`, `/lib64`, `/usr/lib`, and `/usr/lib64`. This narrow
+guardrail prevents OpenShell from mounting its persistent workspace over
+kernel-managed paths or executable and library roots used by the supervisor;
+it does not validate the integrity of a custom image. Before workload launch,
 a one-shot validator drops to the final identity and repeats the safe walk with
 kernel effective-access checks, including POSIX ACL grants and LSM denials.
 Image `VOLUME` declarations that mask the workdir or one of its parents are
