@@ -316,6 +316,14 @@ fn copy_self(dest: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_local_oci_identity_environment(
+    oci_user: Option<&str>,
+    run_as_user: Option<&str>,
+    run_as_group: Option<&str>,
+) -> bool {
+    oci_user.is_some() && run_as_user == Some("") && run_as_group == Some("")
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_sidecar_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
     use miette::Context as _;
@@ -540,6 +548,28 @@ fn main() -> Result<()> {
         );
     }
 
+    // Docker and Podman reserve this environment variable even when the OCI
+    // image declares an empty USER. Validate a non-default image workspace
+    // before initializing logging, policy, credentials, TLS, or networking.
+    let oci_user = std::env::var(openshell_core::sandbox_env::OCI_IMAGE_USER).ok();
+    let run_as_user = std::env::var(openshell_core::sandbox_env::SANDBOX_UID).ok();
+    let run_as_group = std::env::var(openshell_core::sandbox_env::SANDBOX_GID).ok();
+    let local_oci_identity = is_local_oci_identity_environment(
+        oci_user.as_deref(),
+        run_as_user.as_deref(),
+        run_as_group.as_deref(),
+    );
+    if local_oci_identity {
+        let workdir = args.workdir.as_deref().ok_or_else(|| {
+            miette::miette!("local container driver did not supply a workspace workdir")
+        })?;
+        if workdir != openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT {
+            openshell_supervisor_process::process::validate_oci_workspace_structure(Path::new(
+                workdir,
+            ))?;
+        }
+    }
+
     // Try to open a rolling log file; fall back to stderr-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).
     // Rotates daily, keeps the 3 most recent files to bound disk usage.
@@ -757,6 +787,25 @@ mod tests {
         assert_eq!(mode & 0o777, 0o755, "destination must be 0755");
         let copied = std::fs::read(&dest).unwrap();
         assert_eq!(copied, b"#!/bin/false\n");
+    }
+
+    #[test]
+    fn early_workspace_validation_is_scoped_to_local_oci_drivers() {
+        assert!(is_local_oci_identity_environment(
+            Some(""),
+            Some(""),
+            Some("")
+        ));
+        assert!(!is_local_oci_identity_environment(
+            Some("app"),
+            Some("1000"),
+            Some("1000")
+        ));
+        assert!(!is_local_oci_identity_environment(
+            None,
+            Some("10001"),
+            Some("10001")
+        ));
     }
 
     #[test]

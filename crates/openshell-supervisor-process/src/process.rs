@@ -1427,6 +1427,7 @@ fn validate_workspace_component(
             path.display()
         ));
     }
+    reject_special_workspace_filesystem(path)?;
     let required = if is_workspace { 0o3 } else { 0o1 };
     if !identity_has_permissions(&metadata, uid, gid, supplementary_gids, required) {
         let requirement = if is_workspace {
@@ -1444,24 +1445,40 @@ fn validate_workspace_component(
 
 #[cfg(target_os = "linux")]
 pub fn validate_oci_workspace_as_effective_identity(root: &Path) -> Result<()> {
+    validate_oci_workspace_fd_walk(root, true)
+}
+
+/// Validate an OCI workspace's visible structure without testing identity
+/// permissions. Local container supervisors run this before loading policy,
+/// credentials, or networking state.
+#[cfg(target_os = "linux")]
+pub fn validate_oci_workspace_structure(root: &Path) -> Result<()> {
+    validate_oci_workspace_fd_walk(root, false)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_oci_workspace_fd_walk(root: &Path, validate_effective_access: bool) -> Result<()> {
     use rustix::fs::{Access, AtFlags, FileType, Mode, OFlags};
 
     let components = validated_workspace_components(root, false)?;
     let open_flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut current_path = PathBuf::from("/");
     let mut current_fd = rustix::fs::open("/", open_flags, Mode::empty()).into_diagnostic()?;
-    rustix::fs::accessat(
-        &current_fd,
-        ".",
-        Access::EXEC_OK,
-        AtFlags::EACCESS | AtFlags::SYMLINK_NOFOLLOW,
-    )
-    .map_err(|error| {
-        miette::miette!(
-            "workspace path component '{}' is not traversable by the sandbox identity in the image: {error}",
-            current_path.display()
+    reject_special_workspace_filesystem_fd(&current_fd, &current_path)?;
+    if validate_effective_access {
+        rustix::fs::accessat(
+            &current_fd,
+            ".",
+            Access::EXEC_OK,
+            AtFlags::EACCESS | AtFlags::SYMLINK_NOFOLLOW,
         )
-    })?;
+        .map_err(|error| {
+            miette::miette!(
+                "workspace path component '{}' is not traversable by the sandbox identity in the image: {error}",
+                current_path.display()
+            )
+        })?;
+    }
 
     let last_component = components.len().saturating_sub(1);
     for (index, component) in components.into_iter().enumerate() {
@@ -1496,18 +1513,20 @@ pub fn validate_oci_workspace_as_effective_identity(root: &Path) -> Result<()> {
         }
 
         let is_workspace = index == last_component;
-        rustix::fs::accessat(
-            &current_fd,
-            &component,
-            Access::EXEC_OK,
-            AtFlags::EACCESS | AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|error| {
-            miette::miette!(
-                "workspace path component '{}' is not traversable by the sandbox identity in the image: {error}",
-                current_path.display()
+        if validate_effective_access {
+            rustix::fs::accessat(
+                &current_fd,
+                &component,
+                Access::EXEC_OK,
+                AtFlags::EACCESS | AtFlags::SYMLINK_NOFOLLOW,
             )
-        })?;
+            .map_err(|error| {
+                miette::miette!(
+                    "workspace path component '{}' is not traversable by the sandbox identity in the image: {error}",
+                    current_path.display()
+                )
+            })?;
+        }
 
         let next_fd = rustix::fs::openat(&current_fd, &component, open_flags, Mode::empty())
             .map_err(|error| {
@@ -1516,12 +1535,89 @@ pub fn validate_oci_workspace_as_effective_identity(root: &Path) -> Result<()> {
                     current_path.display()
                 )
             })?;
-        if is_workspace {
+        reject_special_workspace_filesystem_fd(&next_fd, &current_path)?;
+        if is_workspace && validate_effective_access {
             validate_effective_workspace_write(&next_fd, &current_path)?;
         }
         current_fd = next_fd;
     }
 
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn validate_oci_workspace_structure(root: &Path) -> Result<()> {
+    let components = validated_workspace_components(root, false)?;
+    let mut current = PathBuf::from("/");
+    for component in components {
+        current.push(component);
+        let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+            miette::miette!(
+                "failed to inspect image workspace path component '{}': {error}",
+                current.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(miette::miette!(
+                "workspace path component '{}' is a symlink — refusing to follow it",
+                current.display()
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(miette::miette!(
+                "workspace path component '{}' is not a directory",
+                current.display()
+            ));
+        }
+        reject_special_workspace_filesystem(&current)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reject_special_workspace_filesystem_fd(fd: &impl std::os::fd::AsFd, path: &Path) -> Result<()> {
+    let fs = rustix::fs::fstatfs(fd).into_diagnostic()?;
+    #[allow(clippy::cast_sign_loss)]
+    let filesystem_type = fs.f_type as u64;
+    reject_special_workspace_filesystem_type(path, filesystem_type)
+}
+
+#[cfg(target_os = "linux")]
+fn reject_special_workspace_filesystem(path: &Path) -> Result<()> {
+    let fs = rustix::fs::statfs(path).into_diagnostic()?;
+    #[allow(clippy::cast_sign_loss)]
+    let filesystem_type = fs.f_type as u64;
+    reject_special_workspace_filesystem_type(path, filesystem_type)
+}
+
+#[cfg(target_os = "linux")]
+fn reject_special_workspace_filesystem_type(path: &Path, filesystem_type: u64) -> Result<()> {
+    // Linux filesystem magic values for virtual/kernel-managed filesystems.
+    const SPECIAL_FILESYSTEMS: &[u64] = &[
+        0x0000_1cd1, // devpts
+        0x0000_9fa0, // proc
+        0x0102_1994, // tmpfs (including the container /dev tree)
+        0x1980_0202, // mqueue
+        0x0027_e0eb, // cgroup
+        0x4249_4e4d, // bpf
+        0x6265_6572, // sysfs
+        0x6367_7270, // cgroup2
+        0x6462_6720, // debugfs
+        0x7363_6673, // securityfs
+        0x7472_6163, // tracefs
+    ];
+    if SPECIAL_FILESYSTEMS.contains(&filesystem_type) {
+        return Err(miette::miette!(
+            "workspace path component '{}' is on a kernel-managed filesystem (type {filesystem_type:#x})",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn reject_special_workspace_filesystem(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1831,7 +1927,7 @@ pub fn prepare_filesystem_with_identity(
 
     let (uid, gid, supplementary_gids) = resolve_filesystem_identity(policy, resolved_identity)?;
 
-    // Docker owns workspace resolution and must make the selected root usable
+    // Local OCI drivers own workspace resolution and must make the selected root usable
     // by the final effective identity, including when both policy identity
     // fields were explicit. Validate it before processing any user-authored
     // read-write paths so an unsafe image path fails first. Other drivers
@@ -1867,8 +1963,8 @@ pub fn prepare_filesystem_with_identity(
     }
 
     // Retain the existing Kubernetes/OpenShift behavior for driver-injected
-    // numeric identities. Docker clears this variable and does not receive
-    // identity-specific workspace preparation.
+    // numeric identities. Docker and Podman clear this variable and do not
+    // receive identity-specific workspace preparation.
     if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
         let sandbox_home = Path::new("/sandbox");
         if sandbox_home.exists() {
@@ -3198,6 +3294,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn structural_workspace_validation_rejects_symlink_components_without_testing_writes() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp_root = std::env::temp_dir().canonicalize().unwrap();
+        let dir = tempfile::tempdir_in(temp_root).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        validate_oci_workspace_structure(&real)
+            .expect("structure-only validation must not require write access");
+
+        let alias = dir.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let error = validate_oci_workspace_structure(&alias).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn structural_workspace_validation_rejects_kernel_managed_filesystems() {
+        let error = reject_special_workspace_filesystem_type(Path::new("/renamed-proc"), 0x9fa0)
+            .unwrap_err();
+        assert!(error.to_string().contains("kernel-managed filesystem"));
     }
 
     #[cfg(unix)]

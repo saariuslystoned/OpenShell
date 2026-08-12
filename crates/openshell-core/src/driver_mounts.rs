@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::container_paths::{CONTROL_ROOTS, OCI_RUNTIME_MOUNT_ROOTS};
+use crate::container_paths::{CONTROL_ROOTS, ESSENTIAL_SYSTEM_ROOTS, OCI_RUNTIME_MOUNT_ROOTS};
 
 /// `SELinux` relabelling mode for bind mounts.
 ///
@@ -116,7 +116,40 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
     for control_path in CONTROL_ROOTS {
         validate_workspace_control_path(&workspace_root, control_path)?;
     }
+    for essential_path in ESSENTIAL_SYSTEM_ROOTS {
+        validate_workspace_essential_path(&workspace_root, essential_path)?;
+    }
 
+    Ok(workspace_root)
+}
+
+/// Resolve and validate the OCI workspace metadata shared by local container
+/// drivers.
+///
+/// Runtime-specific image inspection stays in each driver. This helper keeps
+/// the security decisions for image-declared workdirs and volumes identical
+/// between Docker and Podman.
+pub fn resolve_oci_workspace_from_image<'a>(
+    working_dir: &str,
+    image_volume_targets: impl IntoIterator<Item = &'a str>,
+    control_paths: impl IntoIterator<Item = &'a str> + Clone,
+) -> Result<String, String> {
+    let workspace_root = resolve_oci_workspace_root(working_dir)?;
+    for control_path in control_paths.clone() {
+        validate_workspace_control_path(&workspace_root, control_path)?;
+    }
+    for volume in image_volume_targets {
+        validate_container_mount_target(volume)
+            .map_err(|error| format!("invalid image-declared volume '{volume}': {error}"))?;
+        validate_workspace_mount_target(volume, &workspace_root).map_err(|_| {
+            format!(
+                "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
+            )
+        })?;
+        for control_path in control_paths.clone() {
+            validate_mount_control_path(volume, control_path)?;
+        }
+    }
     Ok(workspace_root)
 }
 
@@ -173,6 +206,23 @@ fn validate_workspace_reserved_path(
     if paths_overlap(workspace, reserved) {
         return Err(format!(
             "OCI WorkingDir '{workspace_root}' conflicts with {description} '{reserved_path}'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_essential_path(
+    workspace_root: &str,
+    essential_path: &str,
+) -> Result<(), String> {
+    let normalized_workspace = normalize_absolute_container_path(workspace_root, "OCI WorkingDir")?;
+    let normalized_essential =
+        normalize_absolute_container_path(essential_path, "essential system path")?;
+    let workspace = Path::new(&normalized_workspace);
+    let essential = Path::new(&normalized_essential);
+    if path_is_or_under(essential, workspace) {
+        return Err(format!(
+            "OCI WorkingDir '{workspace_root}' would cover essential system path '{essential_path}'"
         ));
     }
     Ok(())
@@ -299,6 +349,17 @@ mod tests {
             "/run/openshell-sidecar/control.sock",
             "/run/netns/project",
             "/var/run/netns/project",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/usr",
+            "/usr/bin",
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/local",
+            "/usr/local/bin",
+            "/usr/local/lib",
         ] {
             assert!(
                 resolve_oci_workspace_root(invalid).is_err(),
@@ -313,6 +374,7 @@ mod tests {
             "/opt/app",
             "/usr/bin/project",
             "/usr/src/app",
+            "/usr/local/app",
             "/var/lib/app",
             "/var/app/current",
             "/var/task",
@@ -327,6 +389,35 @@ mod tests {
                 "expected application workspace '{valid}' to remain valid"
             );
         }
+    }
+
+    #[test]
+    fn image_workspace_resolution_rejects_volume_and_control_path_collisions() {
+        let error = resolve_oci_workspace_from_image(
+            "/workspace/project",
+            ["/workspace"],
+            ["/custom/ssh.sock"],
+        )
+        .unwrap_err();
+        assert!(error.contains("masks OCI WorkingDir"));
+
+        let error = resolve_oci_workspace_from_image(
+            "/workspace/project",
+            ["/custom"],
+            ["/custom/ssh.sock"],
+        )
+        .unwrap_err();
+        assert!(error.contains("OpenShell control path"));
+
+        assert_eq!(
+            resolve_oci_workspace_from_image(
+                "/usr/src/app",
+                ["/usr/src/app/cache"],
+                ["/custom/ssh.sock"],
+            )
+            .unwrap(),
+            "/usr/src/app"
+        );
     }
 
     #[test]

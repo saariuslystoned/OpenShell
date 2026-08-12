@@ -25,6 +25,35 @@ pub const NETNS_IPROUTE2_ROOT: &str = "/var/run/netns";
 /// <https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#default-filesystems>
 pub const OCI_RUNTIME_MOUNT_ROOTS: &[&str] = &["/proc", "/sys", "/dev"];
 
+/// Execution and library roots that an image-selected workspace must not
+/// replace or contain.
+///
+/// Unlike control and kernel-managed paths, application directories below a
+/// system namespace remain valid workspace targets. For example, `/usr` is
+/// rejected because it contains `/usr/bin`, while `/usr/src/app` is allowed.
+pub const ESSENTIAL_SYSTEM_ROOTS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib",
+    "/usr/lib32",
+    "/usr/lib64",
+    "/usr/libx32",
+    "/usr/libexec",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/local/lib",
+    "/usr/local/lib32",
+    "/usr/local/lib64",
+    "/usr/local/libx32",
+    "/usr/local/libexec",
+];
+
 /// High-level namespaces mounted or created by `OpenShell` inside sandboxes.
 ///
 /// This is intentionally not a general Linux system-path denylist. Kernel and

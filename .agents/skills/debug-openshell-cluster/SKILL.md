@@ -174,7 +174,7 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Root and missing identities are rejected.
 - Sandbox fails before readiness with an OCI workspace validation error: inspect the image's `WorkingDir` using the immutable image ID reported by the gateway. Empty, `/`, and explicit `/sandbox` use the managed `/sandbox` compatibility workspace. Any other workdir must be an absolute normalized directory with no symlink components; the final policy UID, primary GID, and supplementary groups must pass the kernel's effective traverse/write checks, including POSIX ACL and LSM decisions. OpenShell does not create, chown, or chmod a non-default image workdir.
-- Docker also rejects an image `VOLUME` that covers the workdir or one of its parents because the runtime would mask the immutable path before validation. Move the `VOLUME` below the workspace or remove the declaration.
+- Docker and Podman reject an image `VOLUME` that covers the workdir or one of its parents. Move the `VOLUME` below the workspace or remove the declaration.
 - A workdir rejected as a special filesystem or OpenShell control-path collision cannot be made valid with permissions. Move the image workdir away from kernel-backed mounts and the concrete supervisor, TLS, token, runtime, and socket paths named in the error.
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify `OPENSHELL_DOCKER_SUPERVISOR_BIN`, the sibling binary next to `openshell-gateway`, or the configured supervisor image contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and supervisor callback endpoint.
@@ -202,6 +202,8 @@ Common findings:
 - Rootless networking unavailable: inspect Podman network configuration.
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Root and missing identities are rejected.
+- Sandbox fails before readiness with an OCI workspace validation error: inspect the image's OCI `WorkingDir`. Empty, `/`, and `/sandbox` use managed `/sandbox`; other paths must be normalized, contain no symlinks, avoid protected runtime/control/system roots, and be writable by the final OCI/policy identity. OpenShell does not create, chown, or chmod a non-default workdir.
+- Podman mounts the persistent named workspace volume at OCI `WorkingDir` and validates after normal copy-up. Inspect the volume inside the failed container with `podman inspect` and `podman unshare` as appropriate. Ownership and SELinux behavior can differ between rootless and rootful deployments; fix the image or runtime configuration rather than expecting OpenShell to repair permissions.
 - Supervisor cannot call back: check callback endpoint and gateway logs.
 - Gateway exits before becoming healthy with a callback-listener discovery
   error: inspect `podman info --debug`, the configured Podman network, and the

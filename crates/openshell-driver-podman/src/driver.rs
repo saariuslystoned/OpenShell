@@ -54,6 +54,8 @@ pub struct PodmanComputeDriver {
     rootless: bool,
     /// Rootless network helper reported by Podman, such as `pasta`.
     rootless_network_cmd: String,
+    /// Serialize type=image attach/start with detach during container removal.
+    container_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
 }
@@ -391,6 +393,7 @@ impl PodmanComputeDriver {
             network_gateway_ip,
             rootless,
             rootless_network_cmd,
+            container_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -692,10 +695,8 @@ impl PodmanComputeDriver {
                 "podman image '{image}' inspection did not return an immutable image ID"
             )));
         }
-        let image_user = inspected_image
-            .config
-            .as_ref()
-            .map_or("", |config| config.user.as_str());
+        let resolved_image =
+            container::ResolvedPodmanImage::from_inspect(&inspected_image, &self.config)?;
 
         for image in
             container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
@@ -761,8 +762,7 @@ impl PodmanComputeDriver {
             token_secret_name.as_deref(),
             gpu_devices.as_deref(),
             image,
-            &inspected_image.id,
-            image_user,
+            &resolved_image,
         ) {
             Ok(spec) => spec,
             Err(e) => {
@@ -770,8 +770,31 @@ impl PodmanComputeDriver {
                 return Err(e);
             }
         };
-        match self.client.create_container(&spec).await {
-            Ok(_) => {}
+        // Podman implements the supervisor as a shared type=image mount. Keep
+        // attach/start atomic with respect to another sandbox's removal.
+        let lifecycle_result = {
+            let _lifecycle_guard = self.container_lifecycle_lock.lock().await;
+            match self.client.create_container(&spec).await {
+                Ok(_) => match self.client.start_container(&name).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        warn!(
+                            sandbox_name = %sandbox.name,
+                            error = %error,
+                            "Failed to start container; cleaning up"
+                        );
+                        let _ = self
+                            .client
+                            .remove_container(&name, self.config.stop_timeout_secs)
+                            .await;
+                        Err(error)
+                    }
+                },
+                Err(error) => Err(error),
+            }
+        };
+        match lifecycle_result {
+            Ok(()) => {}
             Err(PodmanApiError::Conflict(_)) => {
                 // Clean up the volume we just created. It is keyed by *this*
                 // sandbox's ID, not the conflicting container's ID (which
@@ -784,21 +807,6 @@ impl PodmanComputeDriver {
                 cleanup_created().await;
                 return Err(ComputeDriverError::from(e));
             }
-        }
-
-        // 5. Start container.
-        if let Err(e) = self.client.start_container(&name).await {
-            warn!(
-                sandbox_name = %sandbox.name,
-                error = %e,
-                "Failed to start container; cleaning up"
-            );
-            let _ = self
-                .client
-                .remove_container(&name, self.config.stop_timeout_secs)
-                .await;
-            cleanup_created().await;
-            return Err(ComputeDriverError::from(e));
         }
 
         info!(
@@ -865,14 +873,17 @@ impl PodmanComputeDriver {
         // Keep stop, timeout, and removal in one Podman operation. Splitting
         // stop and remove can race with another container starting an image
         // mount when the stop reaches its timeout.
-        let container_existed = match self
-            .client
-            .remove_container(&container_id, self.config.stop_timeout_secs)
-            .await
-        {
-            Ok(()) => true,
-            Err(PodmanApiError::NotFound(_)) => false,
-            Err(e) => return Err(ComputeDriverError::from(e)),
+        let container_existed = {
+            let _lifecycle_guard = self.container_lifecycle_lock.lock().await;
+            match self
+                .client
+                .remove_container(&container_id, self.config.stop_timeout_secs)
+                .await
+            {
+                Ok(()) => true,
+                Err(PodmanApiError::NotFound(_)) => false,
+                Err(e) => return Err(ComputeDriverError::from(e)),
+            }
         };
 
         // Remove workspace volume.
@@ -1009,6 +1020,7 @@ impl PodmanComputeDriver {
             network_gateway_ip: None,
             rootless: false,
             rootless_network_cmd: String::new(),
+            container_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,

@@ -464,6 +464,13 @@ field wins independently; omitted fields fall back to the image declaration.
 An image with no `USER` fails before readiness unless policy supplies both
 fields.
 
+Docker and Podman custom images may declare an absolute OCI `WORKDIR`. Empty,
+`/`, and `/sandbox` use the managed `/sandbox` compatibility workspace. For any
+other path, the image author must make the final OCI/policy identity able to
+traverse and write it. OpenShell validates the effective workspace before
+readiness and does not create, chown, or chmod it. Podman mounts its persistent
+named volume at that path and performs normal initial copy-up.
+
 ### Forward ports
 
 ```bash

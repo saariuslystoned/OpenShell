@@ -2383,24 +2383,12 @@ fn build_container_create_body_for_image(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
-    let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
-        .map_err(Status::failed_precondition)?;
-    driver_mounts::validate_workspace_control_path(&workspace_root, &config.ssh_socket_path)
-        .map_err(Status::failed_precondition)?;
-    for volume in &image.volumes {
-        driver_mounts::validate_container_mount_target(volume).map_err(|error| {
-            Status::failed_precondition(format!(
-                "invalid image-declared volume '{volume}': {error}"
-            ))
-        })?;
-        driver_mounts::validate_workspace_mount_target(volume, &workspace_root).map_err(|_| {
-            Status::failed_precondition(format!(
-                "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
-            ))
-        })?;
-        driver_mounts::validate_mount_control_path(volume, &config.ssh_socket_path)
-            .map_err(Status::failed_precondition)?;
-    }
+    let workspace_root = driver_mounts::resolve_oci_workspace_from_image(
+        &image.working_dir,
+        image.volumes.iter().map(String::as_str),
+        std::iter::once(config.ssh_socket_path.as_str()),
+    )
+    .map_err(Status::failed_precondition)?;
     for mount in &driver_config.mounts {
         let target = match mount {
             DockerDriverMountConfig::Bind { target, .. }
