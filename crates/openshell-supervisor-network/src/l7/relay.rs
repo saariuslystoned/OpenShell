@@ -569,8 +569,12 @@ where
         // on this host:port. Re-check it against the config that actually
         // matched: the opt-in is per-endpoint, and one endpoint enabling it
         // must not loosen parsing for the others.
+        // Check `req.target`, not `route_target`: redaction percent-decodes any
+        // segment holding a credential placeholder and re-inserts the redacted
+        // form without re-encoding, so a `%2F` sharing that segment becomes a
+        // literal `/` and would escape this check.
         if !config.allow_encoded_slash
-            && crate::l7::path::canonical_path_has_encoded_slash(&route_target)
+            && crate::l7::path::canonical_path_has_encoded_slash(&req.target)
         {
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
@@ -6215,6 +6219,79 @@ network_policies:
         assert!(
             response.contains("not allowed on this endpoint"),
             "denial must name the encoded-slash reason: {response}"
+        );
+
+        let mut upstream_bytes = [0u8; 16];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_bytes),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "request must not reach upstream"
+        );
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Credential redaction percent-decodes any segment holding a placeholder
+    /// and re-inserts the redacted form without re-encoding it. A `%2F` sharing
+    /// that segment therefore becomes a literal `/` in the redacted target, so
+    /// the scoping check must read the canonical target rather than the
+    /// redacted one — otherwise a placeholder is enough to smuggle an encoded
+    /// slash past an endpoint that never opted in.
+    #[tokio::test]
+    async fn route_selected_encoded_slash_check_survives_credential_redaction() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, ENCODED_SLASH_SCOPING_POLICY).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = encoded_slash_scoping_configs();
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            std::iter::once(("TOKEN".to_string(), "real-token".to_string())).collect(),
+        );
+        let placeholder = child_env.get("TOKEN").expect("placeholder env").clone();
+        let ctx = L7EvalContext {
+            secret_resolver: resolver.map(Arc::new),
+            ..encoded_slash_scoping_ctx()
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        // Placeholder and encoded slash in the same segment, on the endpoint
+        // that did NOT opt into encoded slashes.
+        let request = format!(
+            "GET /admin/{placeholder}%2Fx HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n"
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("not allowed on this endpoint"),
+            "redaction must not hide the encoded slash: {response}"
         );
 
         let mut upstream_bytes = [0u8; 16];
