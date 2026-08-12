@@ -133,18 +133,18 @@ kernel-managed filesystems, and OpenShell control paths. The driver also
 rejects a workdir that overlaps `/proc`, `/sys`, `/dev`, or the supervisor's
 minimal executable and library roots in either direction. This prevents
 OpenShell from placing its persistent workspace over those paths; it does not
-attempt to establish the integrity of a custom image. The supervisor then
-verifies that the final OCI/policy identity can traverse and write the mounted
-workspace before readiness. The resolved path becomes both cwd and `HOME` for
-direct and SSH children.
+attempt to establish the integrity of a custom image or validate workdir
+permissions. The resolved path becomes both cwd and `HOME` for direct and SSH
+children.
 
 OpenShell does not create, chown, or chmod a non-default workdir. Podman may
 initialize or adjust a named-volume mountpoint as part of its own volume
 semantics, but OpenShell does not repair the result. Image authors must make
 the declared `USER` able to use the declared `WORKDIR`; unusable images fail
-before readiness. Rootless, rootful, user-namespace, and SELinux configurations
-can differ in volume initialization behavior, so validate custom images in the
-deployment's actual Podman configuration.
+naturally when the workload changes directory or writes. Rootless, rootful,
+user-namespace, and SELinux configurations can differ in volume initialization
+behavior, so validate custom images in the deployment's actual Podman
+configuration.
 
 ## Supervisor Sideloading
 
@@ -332,7 +332,7 @@ sequenceDiagram
 
     D->>P: start_container
     Note over P: Podman performs named-volume copy-up
-    Note over P: Supervisor validates structure, then final identity access
+    Note over P: Supervisor validates the copied-up workspace structure
     D-->>GW: Ok
 ```
 

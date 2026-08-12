@@ -450,9 +450,11 @@ Docker and Podman also inspect OCI `WorkingDir`. An absolute value becomes the
 agent workspace; an empty, root (`/`), or explicit `/sandbox` value uses the
 managed `/sandbox` compatibility workspace.
 OpenShell creates and owns that compatibility workspace. Any other workdir must
-be usable without OpenShell creating it or changing its ownership or mode. The
-completed UID/GID and supplementary groups must be able to traverse every
-parent and write and enter the effective workspace.
+have directory-only, non-symlink components when the supervisor validates it;
+OpenShell does not create image-derived components or change their ownership or
+mode. The image author is responsible for making the final OCI/policy identity
+able to traverse and write it. An unusable image fails naturally when its workload
+changes directory or writes.
 
 Before loading policy, credentials, TLS, or networking state, the final
 supervisor rejects symlink components, non-directories, kernel-managed
@@ -461,18 +463,17 @@ direction with `/proc`, `/sys`, `/dev`, `/bin`, `/sbin`, `/usr/bin`,
 `/usr/sbin`, `/lib`, `/lib64`, `/usr/lib`, and `/usr/lib64`. This narrow
 guardrail prevents OpenShell from mounting its persistent workspace over
 kernel-managed paths or executable and library roots used by the supervisor;
-it does not validate the integrity of a custom image. Before workload launch,
-a one-shot validator drops to the final identity and repeats the safe walk with
-kernel effective-access checks, including POSIX ACL grants and LSM denials.
-Image `VOLUME` declarations that mask the workdir or one of its parents are
-rejected before container creation.
+it does not validate custom-image integrity or workdir permissions. Image
+`VOLUME` declarations that mask the workdir or one of its parents are rejected
+before container creation.
 
 Docker validates the image directory directly. Podman mounts its persistent
 named workspace volume at the resolved workdir and validates the result after
 Podman's normal initial copy-up. OpenShell does not repair Podman volume
 ownership or permissions. Image authors are responsible for making `USER` able
-to use `WORKDIR`; failures surface before readiness. Rootless, rootful,
-user-namespace, and SELinux configurations may initialize volumes differently.
+to use `WORKDIR`; failures surface naturally when the workload changes directory
+or writes. Rootless, rootful, user-namespace, and SELinux configurations may
+initialize volumes differently.
 The resolved workspace is the cwd and `HOME` for direct and SSH children. The
 supervisor itself starts from `/`, so a missing or invalid workspace is handled
 during readiness instead of preventing the container runtime from starting it.

@@ -617,7 +617,13 @@ fn container_creation_uses_inspected_immutable_image() {
     assert_eq!(body.working_dir.as_deref(), Some("/"));
     assert_eq!(
         body.cmd.as_deref(),
-        Some(&["--workdir".to_string(), "/workspace/project".to_string()][..])
+        Some(
+            &[
+                "--validate-oci-workspace".to_string(),
+                "--workdir".to_string(),
+                "/workspace/project".to_string(),
+            ][..]
+        )
     );
     assert!(body.env.unwrap().contains(&format!(
         "{}=1234:1235",
@@ -1492,7 +1498,11 @@ fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
     );
     assert_eq!(
         create_body.cmd,
-        Some(vec!["--workdir".to_string(), "/sandbox".to_string()])
+        Some(vec![
+            "--validate-oci-workspace".to_string(),
+            "--workdir".to_string(),
+            "/sandbox".to_string(),
+        ])
     );
     assert_eq!(
         create_body

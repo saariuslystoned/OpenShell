@@ -202,27 +202,25 @@ primary GID. It does not rewrite the account files.
 Docker and Podman use an absolute OCI working directory as the workspace. An
 empty, root (`/`), or explicit `/sandbox` declaration uses `/sandbox`, which
 OpenShell creates and owns as a compatibility workspace. OpenShell does not
-create, chown, or chmod any other workdir. The completed identity, including
-supplementary groups, must be able to traverse every parent and write and enter
-the effective workspace.
+create, chown, or chmod any other workdir. Image authors are responsible for
+making the final OCI/policy identity able to traverse and write that workdir.
+An unusable image fails naturally when its workload changes directory or writes.
 
-The final supervisor validates non-default paths twice: a no-follow structural
-walk runs before policy, credential, TLS, or networking initialization, then a
-one-shot validator drops to the final identity and uses kernel access checks
-before workload launch. The checks reject symlinks, non-directories,
-kernel-managed filesystems, and OpenShell control paths. They also reject
-overlap in either direction with `/proc`, `/sys`, `/dev`, `/bin`, `/sbin`,
-`/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`, `/usr/lib`, or `/usr/lib64`. The
-first three are kernel-managed OCI mounts; the others protect executable and
-library roots used by the supervisor. This is a mount-placement guardrail, not
-an image-integrity guarantee. Image `VOLUME` declarations and driver-config
-mounts may not mask the workspace.
+Before policy, credential, TLS, or networking initialization, the final
+supervisor performs a no-follow structural walk of every non-default path. It
+rejects missing components, symlinks, non-directories, kernel-managed
+filesystems, and OpenShell control paths. The drivers also reject overlap in
+either direction with `/proc`, `/sys`, `/dev`, `/bin`, `/sbin`, `/usr/bin`,
+`/usr/sbin`, `/lib`, `/lib64`, `/usr/lib`, or `/usr/lib64`. The first three are
+kernel-managed OCI mounts; the others protect executable and library roots used
+by the supervisor. This is a mount-placement guardrail, not an image-integrity
+or permission guarantee. Image `VOLUME` declarations and driver-config mounts
+may not mask the workspace.
 
 Docker checks the image directory directly. Podman mounts the persistent named
 workspace volume at the resolved workdir and validates it after Podman's normal
 initial copy-up. OpenShell does not repair ownership or permissions after that
-copy-up; image authors are responsible for making the declared final identity
-able to use the workdir. The resolved workspace is the child cwd and `HOME`; when
+copy-up. The resolved workspace is the child cwd and `HOME`; when
 `filesystem.include_workdir` is enabled, it becomes the automatic writable
 policy path. Kubernetes/OpenShift and VM retain their existing `/sandbox`
 workspace behavior.

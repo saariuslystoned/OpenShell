@@ -1020,7 +1020,11 @@ pub fn build_container_spec_for_image(
         rw: false,
     }];
     image_volumes.extend(user_mounts.image_volumes);
-    let mut command = vec!["--workdir".to_string(), image.workspace_root.clone()];
+    let mut command = vec![
+        "--validate-oci-workspace".to_string(),
+        "--workdir".to_string(),
+        image.workspace_root.clone(),
+    ];
     command.extend(upstream_proxy_cli_args(config));
 
     let container_spec = ContainerSpec {
@@ -1468,7 +1472,11 @@ mod tests {
         assert_eq!(container["image_pull_policy"].as_str(), Some("never"));
         assert_eq!(
             container["command"],
-            serde_json::json!(["--workdir", "/workspace/project"])
+            serde_json::json!([
+                "--validate-oci-workspace",
+                "--workdir",
+                "/workspace/project"
+            ])
         );
         assert_eq!(container["work_dir"].as_str(), Some("/"));
         assert!(container["volumes"].as_array().is_some_and(|volumes| {

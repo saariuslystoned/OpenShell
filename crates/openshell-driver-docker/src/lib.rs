@@ -2440,7 +2440,11 @@ fn build_container_create_body_for_image(
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
         // Replace the image CMD with the supervisor's resolved workspace
         // argument so Docker cannot append inherited image arguments.
-        cmd: Some(vec!["--workdir".to_string(), workspace_root]),
+        cmd: Some(vec![
+            "--validate-oci-workspace".to_string(),
+            "--workdir".to_string(),
+            workspace_root,
+        ]),
         labels: Some(labels),
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,

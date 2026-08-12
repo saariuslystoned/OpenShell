@@ -32,7 +32,6 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 /// run `openshell-sandbox debug-rpc get-sandbox-config --sandbox-id <other>`
 /// to confirm the cross-sandbox IDOR guard fires.
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
-const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
@@ -119,6 +118,11 @@ struct Args {
     /// Working directory for the sandboxed process.
     #[arg(long, short)]
     workdir: Option<String>,
+
+    /// Validate a non-default OCI workspace before supervisor initialization.
+    /// Local container drivers set this for image-derived workdirs.
+    #[arg(long, hide = true)]
+    validate_oci_workspace: bool,
 
     /// Timeout in seconds (0 = no timeout).
     #[arg(long, short, default_value = "0")]
@@ -232,50 +236,6 @@ struct Args {
     upstream_proxy_connect_by_hostname: bool,
 }
 
-/// Internal one-shot command used by the privileged supervisor to validate an
-/// image-provided workdir as the final sandbox identity.
-#[derive(Parser, Debug)]
-#[command(name = "validate-workspace", hide = true)]
-struct ValidateWorkspaceArgs {
-    #[arg(long)]
-    workdir: String,
-    #[arg(long)]
-    expected_uid: u32,
-    #[arg(long)]
-    expected_gid: u32,
-}
-
-#[cfg(target_os = "linux")]
-fn validate_workspace(args: &[String]) -> Result<()> {
-    let args = ValidateWorkspaceArgs::try_parse_from(
-        std::iter::once(VALIDATE_WORKSPACE_SUBCOMMAND.to_string()).chain(args.iter().cloned()),
-    )
-    .into_diagnostic()?;
-    let actual = (
-        nix::unistd::geteuid().as_raw(),
-        nix::unistd::getegid().as_raw(),
-    );
-    if actual != (args.expected_uid, args.expected_gid) {
-        return Err(miette::miette!(
-            "workspace validator privilege drop failed: expected {}:{}, got {}:{}",
-            args.expected_uid,
-            args.expected_gid,
-            actual.0,
-            actual.1
-        ));
-    }
-    openshell_supervisor_process::process::validate_oci_workspace_as_effective_identity(Path::new(
-        &args.workdir,
-    ))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn validate_workspace(_args: &[String]) -> Result<()> {
-    Err(miette::miette!(
-        "workspace validation is only supported on Unix"
-    ))
-}
-
 /// Copy the running executable to `dest`, creating parent directories as
 /// needed and ensuring the result is executable (mode `0755`).
 ///
@@ -316,12 +276,19 @@ fn copy_self(dest: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_local_oci_identity_environment(
-    oci_user: Option<&str>,
-    run_as_user: Option<&str>,
-    run_as_group: Option<&str>,
-) -> bool {
-    oci_user.is_some() && run_as_user == Some("") && run_as_group == Some("")
+fn validate_local_oci_workspace(enabled: bool, workdir: Option<&str>) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    let workdir = workdir.ok_or_else(|| {
+        miette::miette!("local container driver did not supply a workspace workdir")
+    })?;
+    if workdir != openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT {
+        openshell_supervisor_process::process::validate_oci_workspace_structure(Path::new(
+            workdir,
+        ))?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -532,10 +499,6 @@ fn main() -> Result<()> {
             std::process::exit(exit);
         });
     }
-    if raw_args.get(1).map(String::as_str) == Some(VALIDATE_WORKSPACE_SUBCOMMAND) {
-        return validate_workspace(&raw_args[2..]);
-    }
-
     let args = Args::parse();
 
     if args.mode.network_init {
@@ -548,27 +511,9 @@ fn main() -> Result<()> {
         );
     }
 
-    // Docker and Podman reserve this environment variable even when the OCI
-    // image declares an empty USER. Validate a non-default image workspace
-    // before initializing logging, policy, credentials, TLS, or networking.
-    let oci_user = std::env::var(openshell_core::sandbox_env::OCI_IMAGE_USER).ok();
-    let run_as_user = std::env::var(openshell_core::sandbox_env::SANDBOX_UID).ok();
-    let run_as_group = std::env::var(openshell_core::sandbox_env::SANDBOX_GID).ok();
-    let local_oci_identity = is_local_oci_identity_environment(
-        oci_user.as_deref(),
-        run_as_user.as_deref(),
-        run_as_group.as_deref(),
-    );
-    if local_oci_identity {
-        let workdir = args.workdir.as_deref().ok_or_else(|| {
-            miette::miette!("local container driver did not supply a workspace workdir")
-        })?;
-        if workdir != openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT {
-            openshell_supervisor_process::process::validate_oci_workspace_structure(Path::new(
-                workdir,
-            ))?;
-        }
-    }
+    // Docker and Podman request this check explicitly. Keep it independent of
+    // OCI/policy identity so explicit run_as fields cannot bypass it.
+    validate_local_oci_workspace(args.validate_oci_workspace, args.workdir.as_deref())?;
 
     // Try to open a rolling log file; fall back to stderr-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).
@@ -726,31 +671,6 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn workspace_validation_subcommand_uses_final_policy_identity() {
-        let uid = nix::unistd::geteuid().as_raw();
-        let gid = nix::unistd::getegid().as_raw();
-        if uid < 1000 || gid < 1000 {
-            return;
-        }
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
-        let root = dir.path().canonicalize().unwrap().join("workspace");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let args = vec![
-            "--workdir".to_string(),
-            root.display().to_string(),
-            "--expected-uid".to_string(),
-            uid.to_string(),
-            "--expected-gid".to_string(),
-            gid.to_string(),
-        ];
-
-        validate_workspace(&args).expect("current identity should retain workspace authority");
-    }
-
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path
     /// so tests don't depend on `current_exe()`.
     fn copy_executable(src: &Path, dest: &Path) -> Result<()> {
@@ -790,22 +710,15 @@ mod tests {
     }
 
     #[test]
-    fn early_workspace_validation_is_scoped_to_local_oci_drivers() {
-        assert!(is_local_oci_identity_environment(
-            Some(""),
-            Some(""),
-            Some("")
-        ));
-        assert!(!is_local_oci_identity_environment(
-            Some("app"),
-            Some("1000"),
-            Some("1000")
-        ));
-        assert!(!is_local_oci_identity_environment(
-            None,
-            Some("10001"),
-            Some("10001")
-        ));
+    fn local_oci_workspace_validation_is_driver_controlled() {
+        validate_local_oci_workspace(false, None)
+            .expect("drivers that do not opt in need no workdir");
+        validate_local_oci_workspace(
+            true,
+            Some(openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT),
+        )
+        .expect("the managed compatibility workspace needs no structural walk");
+        assert!(validate_local_oci_workspace(true, None).is_err());
     }
 
     #[test]
