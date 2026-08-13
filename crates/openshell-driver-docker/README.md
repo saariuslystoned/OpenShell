@@ -38,7 +38,7 @@ image fails naturally when its workload changes directory or writes.
 
 Before loading policy, credentials, TLS, or networking state, the supervisor
 performs a no-follow structural walk. It rejects missing components, symlinks,
-non-directories, kernel-managed filesystems, and OpenShell control paths. This
+non-directories, and OpenShell control paths. This
 check protects workspace mount placement; it does not validate custom-image
 integrity or workdir permissions.
 

@@ -208,8 +208,8 @@ An unusable image fails naturally when its workload changes directory or writes.
 
 Before policy, credential, TLS, or networking initialization, the final
 supervisor performs a no-follow structural walk of every non-default path. It
-rejects missing components, symlinks, non-directories, kernel-managed
-filesystems, and OpenShell control paths. The drivers also reject overlap in
+rejects missing components, symlinks, non-directories, and OpenShell control
+paths. The drivers also reject overlap in
 either direction with `/proc`, `/sys`, `/dev`, `/bin`, `/sbin`, `/usr/bin`,
 `/usr/sbin`, `/lib`, `/lib64`, `/usr/lib`, or `/usr/lib64`. The first three are
 kernel-managed OCI mounts; the others protect executable and library roots used

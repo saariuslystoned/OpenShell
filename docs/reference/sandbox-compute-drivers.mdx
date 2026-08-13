@@ -457,8 +457,8 @@ able to traverse and write it. An unusable image fails naturally when its worklo
 changes directory or writes.
 
 Before loading policy, credentials, TLS, or networking state, the final
-supervisor rejects symlink components, non-directories, kernel-managed
-filesystems, and OpenShell control paths. The drivers reject overlap in either
+supervisor rejects missing or symlink components, non-directories, and
+OpenShell control paths. The drivers reject overlap in either
 direction with `/proc`, `/sys`, `/dev`, `/bin`, `/sbin`, `/usr/bin`,
 `/usr/sbin`, `/lib`, `/lib64`, `/usr/lib`, and `/usr/lib64`. This narrow
 guardrail prevents OpenShell from mounting its persistent workspace over

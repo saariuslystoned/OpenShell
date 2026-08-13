@@ -128,8 +128,8 @@ The driver inspects and pins the sandbox image, then resolves its OCI
 volume is mounted at the normalized absolute workdir and Podman performs its
 normal initial copy-up.
 
-The final supervisor rejects symlink components, non-directories,
-kernel-managed filesystems, and OpenShell control paths. The driver also
+The final supervisor rejects missing or symlink components, non-directories,
+and OpenShell control paths. The driver also
 rejects a workdir that overlaps `/proc`, `/sys`, `/dev`, or the supervisor's
 minimal executable and library roots in either direction. This prevents
 OpenShell from placing its persistent workspace over those paths; it does not

@@ -1310,7 +1310,6 @@ pub fn validate_oci_workspace_structure(root: &Path) -> Result<()> {
     let open_flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut current_path = PathBuf::from("/");
     let mut current_fd = rustix::fs::open("/", open_flags, Mode::empty()).into_diagnostic()?;
-    reject_special_workspace_filesystem_fd(&current_fd, &current_path)?;
 
     for component in components {
         current_path.push(&component);
@@ -1349,7 +1348,6 @@ pub fn validate_oci_workspace_structure(root: &Path) -> Result<()> {
                     current_path.display()
                 )
             })?;
-        reject_special_workspace_filesystem_fd(&next_fd, &current_path)?;
         current_fd = next_fd;
     }
 
@@ -1387,55 +1385,7 @@ pub fn validate_oci_workspace_structure(root: &Path) -> Result<()> {
                 current.display()
             ));
         }
-        reject_special_workspace_filesystem(&current)?;
     }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn reject_special_workspace_filesystem_fd(fd: &impl std::os::fd::AsFd, path: &Path) -> Result<()> {
-    let fs = rustix::fs::fstatfs(fd).into_diagnostic()?;
-    #[allow(clippy::cast_sign_loss)]
-    let filesystem_type = fs.f_type as u64;
-    reject_special_workspace_filesystem_type(path, filesystem_type)
-}
-
-#[cfg(target_os = "linux")]
-fn reject_special_workspace_filesystem(path: &Path) -> Result<()> {
-    let fs = rustix::fs::statfs(path).into_diagnostic()?;
-    #[allow(clippy::cast_sign_loss)]
-    let filesystem_type = fs.f_type as u64;
-    reject_special_workspace_filesystem_type(path, filesystem_type)
-}
-
-#[cfg(target_os = "linux")]
-fn reject_special_workspace_filesystem_type(path: &Path, filesystem_type: u64) -> Result<()> {
-    // Linux filesystem magic values for virtual/kernel-managed filesystems.
-    const SPECIAL_FILESYSTEMS: &[u64] = &[
-        0x0000_1cd1, // devpts
-        0x0000_9fa0, // proc
-        0x0102_1994, // tmpfs (including the container /dev tree)
-        0x1980_0202, // mqueue
-        0x0027_e0eb, // cgroup
-        0x4249_4e4d, // bpf
-        0x6265_6572, // sysfs
-        0x6367_7270, // cgroup2
-        0x6462_6720, // debugfs
-        0x7363_6673, // securityfs
-        0x7472_6163, // tracefs
-    ];
-    if SPECIAL_FILESYSTEMS.contains(&filesystem_type) {
-        return Err(miette::miette!(
-            "workspace path component '{}' is on a kernel-managed filesystem (type {filesystem_type:#x})",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(clippy::unnecessary_wraps)]
-fn reject_special_workspace_filesystem(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -2883,14 +2833,6 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o555);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn structural_workspace_validation_rejects_kernel_managed_filesystems() {
-        let error = reject_special_workspace_filesystem_type(Path::new("/renamed-proc"), 0x9fa0)
-            .unwrap_err();
-        assert!(error.to_string().contains("kernel-managed filesystem"));
     }
 
     #[cfg(unix)]

@@ -1048,8 +1048,7 @@ pub fn build_container_spec_for_image(
         // Without this, the container would run the entrypoint binary with
         // the supervisor path as an argument instead of executing it directly.
         entrypoint: vec![SUPERVISOR_BINARY_PATH.into()],
-        // Keep Podman's existing /sandbox workspace contract explicit while
-        // the supervisor supports driver-selected workdirs. Operator-owned
+        // Pass the resolved image workspace explicitly. Operator-owned
         // corporate proxy flags follow it; the workload command comes from
         // the reserved environment variable.
         command,
