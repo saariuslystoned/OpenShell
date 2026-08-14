@@ -5,3 +5,4 @@
 {"at":"2026-08-14T03:20:52Z","event":"artifact_build","status":"pass","scope":"openshell CLI and gateway debug binaries","live_mutation":false}
 {"at":"2026-08-14T03:20:52Z","event":"upstream_gate_checked","status":"held","issue":"NVIDIA/OpenShell#2740","issue_state":"triage-needed","upstream_pr_created":false,"live_mutation":false}
 {"at":"2026-08-14T03:23:03Z","event":"source_commit","status":"pass","commit":"3a321209d6ebe5980f833f9f20c9d8290cf42910","tree":"bf009fcb688e6b97b03b31f32cf31aade0aeefa9","live_mutation":false}
+{"at":"2026-08-14T03:23:52Z","event":"public_fork_push","status":"pass","remote":"saariuslystoned/OpenShell","branch":"codex/2740-openai-codex-oauth","pushed_head":"109ee37a3b5fae9e78502c1f1f3888cb83886914","upstream_pr_created":false,"live_mutation":false}

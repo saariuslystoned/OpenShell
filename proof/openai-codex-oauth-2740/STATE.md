@@ -1,6 +1,6 @@
 # OpenAI Codex OAuth #2740 — State
 
-Status: SOURCE_COMMITTED_PUSH_PENDING_REVIEW
+Status: PUBLIC_FORK_PUSHED_REVIEW_PENDING
 
 Source base: `c4b500a7de64d0b66e3ee8098f58d14299092162`
 (`NVIDIA/OpenShell` current `main` at closeout)
@@ -18,8 +18,8 @@ Current boundary:
 - Full repository CI, focused security suites, binary build, formatting, and
   diff checks pass.
 - Source implementation is committed at
-  `3a321209d6ebe5980f833f9f20c9d8290cf42910`; public fork push and independent
-  exact-head review remain.
+  `3a321209d6ebe5980f833f9f20c9d8290cf42910` and published on the public fork
+  branch; independent exact-head semantic review remains.
 - Upstream PR creation remains gated on issue #2740 acceptance and contributor
   vouch; a draft body is prepared but no PR was opened.
 - No live OAuth login, credential access, Spark-2 mutation, deploy, merge, or

@@ -22,6 +22,8 @@ merge, or upstream pull request occurred.
 - Source implementation commit:
   `3a321209d6ebe5980f833f9f20c9d8290cf42910` (tree
   `bf009fcb688e6b97b03b31f32cf31aade0aeefa9`).
+- Public fork branch:
+  <https://github.com/saariuslystoned/OpenShell/tree/codex/2740-openai-codex-oauth>.
 - Official Codex source was initially audited at
   `3711943d11a1c69a65afe98757814b6b5244fbaf` and the relevant public client,
   issuer, device-flow, token, revocation, subscription-backend, account-header,
@@ -109,6 +111,6 @@ Built artifact evidence (debug, local proof only):
   `2026-08-14T03:20:52Z`.
 - Upstream PR creation remains held until OpenShell accepts the issue and
   `saariuslystoned` is vouched. The prepared body is in `UPSTREAM_DRAFT.md`.
-- Public fork branch push is authorized after local closeout.
+- Public fork branch was pushed; no pull request was created.
 - Independent exact-head semantic review remains required after the candidate
   commit exists; local CI is not being misrepresented as that review.
