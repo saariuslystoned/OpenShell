@@ -62,7 +62,9 @@ instead of silently rotating identities.
 
 The generic provider create/update commands cannot paste or replace this
 provider's access token or routing metadata. Those values are committed only by
-the gateway's reviewed OAuth lifecycle.
+the gateway's reviewed OAuth lifecycle. The gateway also rejects generic OAuth
+refresh strategies for this provider; only the dedicated
+`openai_codex_oauth` strategy can activate its route.
 
 ## Attach and route
 

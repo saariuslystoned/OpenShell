@@ -20,6 +20,8 @@ attended Sign in with ChatGPT grant owned by the OpenShell gateway.
 - add fail-closed refresh, expiry, account-binding, revocation, and concurrency
   handling
 - cap local route lifetime to one hour even when a token claims a later expiry
+- require the dedicated Codex refresh strategy in both configuration and route
+  publication
 - prevent generic provider APIs from injecting or orphaning Codex credentials
 - document the subscription/API-key distinction and security boundary
 
@@ -41,7 +43,7 @@ grants are not routable.
 ## Verification
 
 - complete `mise run ci`
-- focused server Codex tests: 17 passed
+- focused server Codex tests: 18 passed
 - focused CLI Codex tests: 6 passed
 - focused router gateway-owned tests: 2 passed
 - local CLI/gateway build

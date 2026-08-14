@@ -25,6 +25,9 @@ merge, or upstream pull request occurred.
 - Self-review lifetime-cap repair:
   `67812dd51ae406e582aa62ebb3a9354f7de8d183` (tree
   `80e1ea447857a7479e0c010bec0e9fb79a043bde`).
+- Self-review dedicated-strategy repair:
+  `ec5fa30048b7fbde6a12d7f41f20909666963f28` (tree
+  `8f5450df4898ffd0467545095da8cba1e7d3c0f4`).
 - Public fork branch:
   <https://github.com/saariuslystoned/OpenShell/tree/codex/2740-openai-codex-oauth>.
 - Official Codex source was initially audited at
@@ -66,6 +69,9 @@ merge, or upstream pull request occurred.
   Generic deletion cannot orphan a live grant.
 - Generic provider create/update cannot inject or replace Codex access tokens
   or routing metadata.
+- The Codex provider and its stored route state must both use the dedicated
+  `openai_codex_oauth` refresh strategy. Generic OAuth refresh material cannot
+  activate the provider, and a mismatched persisted strategy is not routable.
 - Supervisor and router enforce the credential expiry carried in a cached
   route, preventing use of stale short-lived credentials. OpenShell also caps
   local route lifetime to the reviewed one-hour maximum even when the token's
@@ -80,7 +86,7 @@ pinned toolchain and Homebrew library path where required.
   clippy, unit/integration/doc tests, Go build/test/lint/generated-proto checks,
   Python 86/86 tests, TypeScript lint/typecheck and 68/68 tests, docs,
   licenses, Helm, and repository policy checks.
-- Focused server Codex suite: 17 passed.
+- Focused server Codex suite: 18 passed.
 - Focused CLI Codex suites: 6 passed.
 - Focused router gateway-owned suite: 2 passed.
 - Cross-crate debug build for `openshell-server` and `openshell-cli`: passed.
@@ -91,8 +97,8 @@ Built artifact evidence (debug, local proof only):
 
 | Artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `target/debug/openshell` | 72,573,512 | `4ed2750fe6555c82bc4c0408303bddb5420d489263d04edd1e7481ed501436a4` |
-| `target/debug/openshell-gateway` | 161,705,824 | `ccc3c0e3d710491f824441e1a8089195c5c09ff8691205f8b075b2eff19d5b3d` |
+| `target/debug/openshell` | 71,778,280 | `90fc719015132e0f16b6df3d5f4856f05825a65eeead2015ed3111464e65fdd8` |
+| `target/debug/openshell-gateway` | 161,941,968 | `a6261e318e11e0ff51636c970adaff422363847eeceaa646739f9f02c2ab5b1f` |
 
 ## Tested failure classes
 
@@ -104,8 +110,8 @@ Built artifact evidence (debug, local proof only):
 - Attached versus unattached or malformed sandbox provider metadata.
 - Hostile base URL and protected-header override attempts.
 - Expired route and stale supervisor-bundle rejection.
-- Direct Codex credential creation/update, generic refresh configuration, and
-  generic deletion bypass attempts.
+- Direct Codex credential creation/update, generic refresh configuration,
+  mismatched stored refresh strategy, and generic deletion bypass attempts.
 
 ## Human and upstream gates
 
