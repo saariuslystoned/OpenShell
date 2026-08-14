@@ -37,11 +37,10 @@ the selected ChatGPT subscription and workspace.
 
 - An OpenAI account with Codex access through ChatGPT.
 - An attended browser session for the one-time device authorization.
-- A gateway with provider profiles enabled:
 
-```shell
-openshell settings set --global --key providers_v2_enabled --value true
-```
+This endpointless provider does not require `providers_v2_enabled`; it grants no
+direct sandbox network policy. The setting remains relevant to other providers
+whose attached profiles contribute endpoint policy.
 
 ## Sign in
 
@@ -102,6 +101,10 @@ reauthorization-required grant is not published as an inference route. The
 gateway publishes a refreshed grant only after its route metadata and access
 token are both committed. Router-side expiry checks also reject a stale cached
 route before each request.
+
+On a failed scheduled gateway bundle refresh, the supervisor removes cached
+Codex subscription routes instead of keeping their gateway-owned credential
+stale. A later successful bundle refresh can restore an authorized route.
 
 ## Log out
 
