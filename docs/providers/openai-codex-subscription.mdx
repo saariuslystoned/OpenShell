@@ -90,9 +90,10 @@ exact provider is attached.
 
 The gateway refreshes the access token before expiry and binds refreshed tokens
 to the same ChatGPT account/workspace identifier. It refuses an unexpected
-account switch. A terminal refresh rejection marks the grant as requiring a new
-sign-in; transient timeouts, rate limits, and server failures are retried without
-printing the upstream response body.
+account switch. The local routing lifetime is capped at one hour even if a token
+claims a later expiry. A terminal refresh rejection marks the grant as requiring
+a new sign-in; transient timeouts, rate limits, and server failures are retried
+without printing the upstream response body.
 
 An in-progress, refresh-failed, expired, revoked, failed-revocation, or
 reauthorization-required grant is not published as an inference route. The

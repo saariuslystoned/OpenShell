@@ -902,15 +902,26 @@ fn decode_jwt_claims<T: for<'de> Deserialize<'de>>(jwt: &str) -> Result<T, Statu
     })
 }
 
-fn jwt_expiry_ms(jwt: &str) -> Result<i64, Status> {
+fn jwt_expiry_ms(jwt: &str, max_lifetime_seconds: i64) -> Result<i64, Status> {
     let claims: JwtExpiryClaims = decode_jwt_claims(jwt)?;
-    let expiry_ms = claims.exp.saturating_mul(1000);
-    if expiry_ms <= current_time_ms() {
+    let asserted_expiry_ms = claims.exp.saturating_mul(1000);
+    let now_ms = current_time_ms();
+    if asserted_expiry_ms <= now_ms {
         return Err(Status::failed_precondition(
             "OpenAI Codex OAuth returned an expired access token; sign in again",
         ));
     }
-    Ok(expiry_ms)
+    // Treat the token's unverified JWT payload only as an upper bound supplied
+    // by the pinned OAuth response. OpenShell owns the local routing lifetime:
+    // a malformed or unexpectedly long `exp` must not extend a credential past
+    // the reviewed refresh policy.
+    let lifetime_cap_seconds = if max_lifetime_seconds > 0 {
+        max_lifetime_seconds
+    } else {
+        DEFAULT_MAX_LIFETIME_SECONDS
+    };
+    let local_expiry_cap_ms = now_ms.saturating_add(lifetime_cap_seconds.saturating_mul(1000));
+    Ok(asserted_expiry_ms.min(local_expiry_cap_ms))
 }
 
 fn codex_account_claims(id_token: &str) -> Result<(String, bool), Status> {
@@ -1047,7 +1058,7 @@ async fn mint_openai_codex_oauth(
         .ok_or_else(|| {
             Status::failed_precondition("OpenAI Codex token endpoint returned no access token")
         })?;
-    let expires_at_ms = jwt_expiry_ms(&access_token)?;
+    let expires_at_ms = jwt_expiry_ms(&access_token, state.max_lifetime_seconds)?;
     let mut material_updates = HashMap::new();
     if let Some(id_token) = token.id_token.filter(|value| !value.trim().is_empty()) {
         let (account_id, is_fedramp) = codex_account_claims(&id_token)?;
@@ -1644,6 +1655,27 @@ mod tests {
         let payload =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
         format!("header.{payload}.signature")
+    }
+
+    #[test]
+    fn openai_codex_access_token_expiry_is_capped_by_reviewed_lifetime() {
+        let now_ms = current_time_ms();
+        let far_future_exp = now_ms / 1000 + 24 * 60 * 60;
+        let token = test_jwt(serde_json::json!({"exp": far_future_exp}));
+
+        let explicit_cap = super::jwt_expiry_ms(&token, 900).expect("explicit lifetime cap");
+        assert!(explicit_cap > now_ms);
+        assert!(explicit_cap.saturating_sub(now_ms) <= 901_000);
+
+        let default_cap = super::jwt_expiry_ms(&token, 0).expect("default lifetime cap");
+        assert!(default_cap > now_ms);
+        assert!(
+            default_cap.saturating_sub(now_ms)
+                <= super::DEFAULT_MAX_LIFETIME_SECONDS * 1000 + 1_000
+        );
+
+        let expired = test_jwt(serde_json::json!({"exp": now_ms / 1000 - 1}));
+        assert!(super::jwt_expiry_ms(&expired, 900).is_err());
     }
 
     fn codex_refresh_state(

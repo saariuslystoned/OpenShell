@@ -17,6 +17,7 @@ credentials:
       strategy: openai_codex_oauth
       token_url: https://auth.openai.com/oauth/token
       refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
       material:
         - name: refresh_token
           description: Codex OAuth refresh token managed exclusively by the OpenShell gateway
