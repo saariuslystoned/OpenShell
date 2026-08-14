@@ -22,6 +22,9 @@ merge, or upstream pull request occurred.
 - Source implementation commit:
   `3a321209d6ebe5980f833f9f20c9d8290cf42910` (tree
   `bf009fcb688e6b97b03b31f32cf31aade0aeefa9`).
+- Self-review lifetime-cap repair:
+  `67812dd51ae406e582aa62ebb3a9354f7de8d183` (tree
+  `80e1ea447857a7479e0c010bec0e9fb79a043bde`).
 - Public fork branch:
   <https://github.com/saariuslystoned/OpenShell/tree/codex/2740-openai-codex-oauth>.
 - Official Codex source was initially audited at
@@ -64,7 +67,9 @@ merge, or upstream pull request occurred.
 - Generic provider create/update cannot inject or replace Codex access tokens
   or routing metadata.
 - Supervisor and router enforce the credential expiry carried in a cached
-  route, preventing use of stale short-lived credentials.
+  route, preventing use of stale short-lived credentials. OpenShell also caps
+  local route lifetime to the reviewed one-hour maximum even when the token's
+  unverified JWT payload claims a later expiry.
 
 ## Verification
 
@@ -75,7 +80,7 @@ pinned toolchain and Homebrew library path where required.
   clippy, unit/integration/doc tests, Go build/test/lint/generated-proto checks,
   Python 86/86 tests, TypeScript lint/typecheck and 68/68 tests, docs,
   licenses, Helm, and repository policy checks.
-- Focused server Codex suite: 16 passed.
+- Focused server Codex suite: 17 passed.
 - Focused CLI Codex suites: 6 passed.
 - Focused router gateway-owned suite: 2 passed.
 - Cross-crate debug build for `openshell-server` and `openshell-cli`: passed.
@@ -86,8 +91,8 @@ Built artifact evidence (debug, local proof only):
 
 | Artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `target/debug/openshell` | 71,693,032 | `8c86ab6ef8703eedf1daf37173e7b0fcbcdd790f2acfa80e557d629d84b77442` |
-| `target/debug/openshell-gateway` | 161,449,904 | `e22a426651660910ace0598b5ac8ba2ce9d6103ed0b126b5294a4b9ca0cba31b` |
+| `target/debug/openshell` | 72,573,512 | `4ed2750fe6555c82bc4c0408303bddb5420d489263d04edd1e7481ed501436a4` |
+| `target/debug/openshell-gateway` | 161,705,824 | `ccc3c0e3d710491f824441e1a8089195c5c09ff8691205f8b075b2eff19d5b3d` |
 
 ## Tested failure classes
 
