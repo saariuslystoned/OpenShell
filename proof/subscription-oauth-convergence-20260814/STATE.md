@@ -1,14 +1,14 @@
 # State
 
 - status: `active-progress`
-- phase: `attended-auth-complete; codex-live-compatibility-checkpoint`
-- updated_at_utc: `2026-08-14T15:28:51Z`
-- writable_head: `f8cbf77623559149e91c63385992e2acb9e8bda0`
+- phase: `live-and-terminal-ci-complete; commit-review-next`
+- updated_at_utc: `2026-08-14T15:51:22Z`
+- writable_head: `6f3b41f736a590827d39014af741598b92e2d08c`
 - grok_input_head: `da8bf1cda063cc309dde4c247218f0c9f062ec6c`
 - common_base: `c4b500a7de64d0b66e3ee8098f58d14299092162`
-- next: checkpoint the route-scoped Codex request rewrite to produce a new VM cache identity, rebuild, then prove both selected providers through OpenClaw and independently rotate/logout/revoke them
+- next: commit and push the proof closeout, rerun exact-head independent review, adjudicate, and audit every goal requirement
 - blocker: live SwarmDash and canonical admission reads are unavailable; neither blocks source inspection or local implementation
-- human_gate: none active; both attended provider logins are complete
+- human_gate: none active; both attended grants were proved, remotely revoked, and locally cleared
 
 ## Current findings
 
@@ -46,9 +46,9 @@
   Rust check/format/Clippy/tests, Go format/lint/build/race tests/proto/docs,
   TypeScript install/generation/lint/typecheck/tests, Python tests/lint/format/
   typecheck, Helm, Markdown/Mermaid, licenses, dependency policy, SBOM, and
-  packaging checks. The decisive post-fix terminal server run passed 1,366 tests with seven
-  pre-existing ignores. Strict Fern validation also passes with zero errors.
-  Exact-head review and runtime proof remain.
+  packaging checks. The terminal post-runtime run passed in 299.32 seconds;
+  its server result was 1,366 passed with seven pre-existing ignores. Strict
+  Fern validation also passes with zero errors. Exact-head review remains.
 - The branch is committed and pushed at `f8cbf776...`; PR #1 points at that
   exact head. Spark-2 OpenClaw completed two authenticated chunked passes with
   zero findings and confidence 0.98 against immutable base `c4b500a7...`.
@@ -57,10 +57,11 @@
 - The PR's ClawSweeper command was not accepted after the immediate and single
   60-second checks, and the fork base contains no ClawSweeper workflow. This is
   recorded as external wiring failure without reposting; it does not block the
-  clean official OpenClaw result. Attended dual-provider runtime proof remains.
-- Both attended OAuth grants are active. Grok already passed a tool-free
-  OpenClaw turn with reverse attachment order, no credential environment, no
-  fallback, and the exact expected response.
+  clean official OpenClaw result.
+- Both attended OAuth grants completed and were used for the terminal matrix.
+  Codex and Grok each passed tool-free OpenClaw turns in reciprocal attachment
+  order, with no credential environment, no fallback, and the exact expected
+  response.
 - The Codex turn exposed a live OpenClaw compatibility edge rather than an OAuth
   failure: OpenClaw sends `max_output_tokens` through `inference.local`, but the
   pinned ChatGPT Codex Responses backend rejects it. The router now removes
@@ -68,5 +69,9 @@
   generic Responses routes; all three focused regressions pass.
 - The first post-fix VM used the prior root image because that cache identity is
   derived from committed `git describe` state. No cache deletion was performed.
-  A source checkpoint commit is the next step so the corrected supervisor boots
-  under a distinct reproducible image identity.
+- Checkpoint `6f3b41f7...` produced the required new VM identity. Both strict
+  OpenClaw baselines, both independent rotations, Codex logout isolation, both
+  fail-closed logout paths, remote revoke, local clear, and zero-credential
+  terminal state are complete. The two task sandboxes were removed and the
+  isolated Gateway was stopped; governed runtime logs remain hashed from
+  `LIVE_RUNTIME.md`.

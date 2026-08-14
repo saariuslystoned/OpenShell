@@ -10,7 +10,9 @@
 - Codex input: `6a2a3dc6f2f32bf47067a5ef15bf78f3bdec9cb5`
 - Grok input: `da8bf1cda063cc309dde4c247218f0c9f062ec6c`
 - Writable branch: `codex/subscription-oauth-convergence-20260814`
-- Committed review head: `f8cbf77623559149e91c63385992e2acb9e8bda0`
+- Prior independently reviewed head: `f8cbf77623559149e91c63385992e2acb9e8bda0`
+- Live-tested compatibility checkpoint:
+  `6f3b41f736a590827d39014af741598b92e2d08c`
 - Review PR: `https://github.com/saariuslystoned/OpenShell/pull/1`
 - Official xAI client reference (read-only):
   `xai-org/grok-build@eb267feff13129e568df38fb6fdf0ceb65f735d6`
@@ -176,6 +178,31 @@
   supervisor. No cache was deleted. The compatibility change is being
   checkpoint-committed so the next VM image receives a distinct reproducible
   source identity before the terminal live matrix.
+- The checkpoint commit `6f3b41f736a590827d39014af741598b92e2d08c`
+  produced a distinct `g6f3b41f7` VM root image. The terminal dual-provider
+  matrix then passed: strict Codex and Grok OpenClaw baselines in reciprocal
+  attachment order; independent generation-advancing rotations with both
+  routes usable; Codex revoke/logout with Codex fail-closed 503 and Grok still
+  passing; and Grok revoke/logout with Grok fail-closed 503. Both providers
+  ended with zero credential keys and no refresh configuration. The one
+  bounded Codex retry after Grok rotation followed an HTTP-200 upstream SSE
+  `server_error` and then passed immediately; it was classified as transient
+  service noise. Full commands, assertions, timestamps, cleanup, and immutable
+  local artifact hashes are in `LIVE_RUNTIME.md`.
+- The terminal post-runtime `mise run ci` passed at
+  `2026-08-14T15:51:22Z` in 299.32 seconds. It includes the complete Rust,
+  Go, TypeScript, Python, Helm, Markdown/Mermaid, license, dependency-policy,
+  SBOM, packaging, and install gates. The terminal server result was 1,366
+  passed, zero failed, and seven pre-existing ignored. The immutable CI log
+  SHA-256 is
+  `af58c1671be01681dddd6af7fdb7b2d97473884bdf288dfa183132a404674510`.
+  A preceding aggregate attempt hit the existing timing-sensitive SBOM
+  same-domain spacing assertion; the unchanged focused suite passed 10/10 and
+  the terminal aggregate run passed it. No product change was made for that
+  non-attributable timing failure.
+- Post-CI `mise run markdown:lint` passed over 120 Markdown files and 166
+  Mermaid-scanned files with zero errors. `mise run docs:build:strict` also
+  passed with zero Fern errors and the same two repository warnings.
 
 ## Required terminal evidence
 
@@ -184,8 +211,7 @@
 - Router expiry/stale-cache and deterministic multi-provider selection tests
 - CRUD-bypass, fencing, revoke/retry, and bearer-isolation tests
 - Required format, lint, unit, integration, and CI commands — complete
-- Dual-provider runtime proof and attended login/OpenClaw proof — attended
-  login and Grok baseline complete; corrected Codex/rotation/logout matrix next
+- Dual-provider runtime proof and attended login/OpenClaw proof — complete
 - Exact-head independent review and adjudication — prior head clean; rerun
   required after the live compatibility fix
 

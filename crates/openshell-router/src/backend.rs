@@ -92,7 +92,7 @@ const COMMON_INFERENCE_REQUEST_HEADERS: [&str; 4] =
 /// and is intentionally omitted here.
 const VERTEX_UNSUPPORTED_BODY_FIELDS: &[&str] = &["context_management"];
 
-/// The ChatGPT Codex subscription backend rejects this otherwise-standard
+/// The `ChatGPT` Codex subscription backend rejects this otherwise-standard
 /// Responses parameter. Keep the rewrite route-scoped: API-key Responses
 /// providers may support and rely on the field.
 const OPENAI_CODEX_UNSUPPORTED_BODY_FIELDS: &[&str] = &["max_output_tokens"];
