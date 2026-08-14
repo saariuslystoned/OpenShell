@@ -22,6 +22,8 @@ attended Sign in with ChatGPT grant owned by the OpenShell gateway.
 - cap local route lifetime to one hour even when a token claims a later expiry
 - require the dedicated Codex refresh strategy in both configuration and route
   publication
+- evict cached Codex routes if the supervisor loses gateway refresh authority,
+  while preserving unrelated inference routes
 - prevent generic provider APIs from injecting or orphaning Codex credentials
 - document the subscription/API-key distinction and security boundary
 
@@ -38,7 +40,8 @@ attached sandbox's route. The untrusted workload receives neither token and no
 direct provider endpoint. Caller-supplied authorization, account, FedRAMP,
 originator, and base-URL overrides are rejected or replaced by gateway-owned
 values. Expired, in-progress, failed, revoked, or reauthorization-required
-grants are not routable.
+grants are not routable. A failed scheduled gateway bundle refresh removes
+cached Codex routes instead of retaining their access credential stale.
 
 ## Verification
 
@@ -46,6 +49,7 @@ grants are not routable.
 - focused server Codex tests: 18 passed
 - focused CLI Codex tests: 6 passed
 - focused router gateway-owned tests: 2 passed
+- focused supervisor inference-route tests: 18 passed
 - local CLI/gateway build
 - formatting and diff checks
 

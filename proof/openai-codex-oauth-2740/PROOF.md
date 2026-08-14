@@ -28,6 +28,9 @@ merge, or upstream pull request occurred.
 - Self-review dedicated-strategy repair:
   `ec5fa30048b7fbde6a12d7f41f20909666963f28` (tree
   `8f5450df4898ffd0467545095da8cba1e7d3c0f4`).
+- Self-review fail-closed route-cache repair:
+  `4c1236f7ec20f42bc7c6ce4cc2c4676f4e7a4ca5` (tree
+  `9cfe26f71e3c5e487350a247c0e14effb3cc650e`).
 - Public source-and-proof checkpoint:
   `7ab45643cfd7c638089877193c89ffdd65ae0392` (tree
   `30e66f8b2392a93c98c89e0bdc9cd445696c613d`).
@@ -79,6 +82,11 @@ merge, or upstream pull request occurred.
   route, preventing use of stale short-lived credentials. OpenShell also caps
   local route lifetime to the reviewed one-hour maximum even when the token's
   unverified JWT payload claims a later expiry.
+- If the supervisor loses the gateway bundle authority, it removes the
+  gateway-owned Codex routes from both route caches while retaining unrelated
+  inference routes. It invalidates the cached revision when a route is removed
+  so the same authoritative revision can restore access after connectivity
+  returns.
 
 ## Verification
 
@@ -92,6 +100,9 @@ pinned toolchain and Homebrew library path where required.
 - Focused server Codex suite: 18 passed.
 - Focused CLI Codex suites: 6 passed.
 - Focused router gateway-owned suite: 2 passed.
+- Focused supervisor inference-route suites: 18 passed, including exact Codex
+  provider-alias recognition and removal from user/system caches while an
+  unrelated route remains available.
 - Cross-crate debug build for `openshell-server` and `openshell-cli`: passed.
 - `git diff --check` and `cargo fmt --all -- --check`: passed.
 - CLI help was exercised only; no login was initiated.
@@ -100,8 +111,8 @@ Built artifact evidence (debug, local proof only):
 
 | Artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `target/debug/openshell` | 71,778,280 | `90fc719015132e0f16b6df3d5f4856f05825a65eeead2015ed3111464e65fdd8` |
-| `target/debug/openshell-gateway` | 161,941,968 | `a6261e318e11e0ff51636c970adaff422363847eeceaa646739f9f02c2ab5b1f` |
+| `target/debug/openshell` | 71,778,280 | `3bae11520dddbab9abfdfcb3866f3658579e3b4c7f679abb09d9fd1d9990215c` |
+| `target/debug/openshell-gateway` | 161,941,968 | `41585670bd60a188cdc931a326c72b1f9acb4b82cf3aecc708d03e8dfe56341c` |
 
 ## Tested failure classes
 
@@ -115,6 +126,8 @@ Built artifact evidence (debug, local proof only):
 - Expired route and stale supervisor-bundle rejection.
 - Direct Codex credential creation/update, generic refresh configuration,
   mismatched stored refresh strategy, and generic deletion bypass attempts.
+- Failed gateway bundle refresh with cached Codex user/system routes, provider
+  alias normalization, and preservation of an unrelated inference route.
 
 ## Human and upstream gates
 
@@ -122,7 +135,8 @@ Built artifact evidence (debug, local proof only):
   account/security approval.
 - Spark-2/OpenClaw integration: **NOT PERFORMED**; no live system was changed.
 - Upstream issue #2740 was still open with `state:triage-needed` at
-  `2026-08-14T03:20:52Z`.
+  `2026-08-14T04:12:08Z`. Vouch discussion #2741 still had zero replies, and
+  `saariuslystoned` was absent from the upstream vouched-contributor list.
 - Upstream PR creation remains held until OpenShell accepts the issue and
   `saariuslystoned` is vouched. The prepared body is in `UPSTREAM_DRAFT.md`.
 - Public fork branch was pushed; no pull request was created.
