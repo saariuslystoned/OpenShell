@@ -29,6 +29,8 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"policy":                true,
 		"providers":             true,
 		"resource_requirements": true,
+		"inference_provider":    true,
+		"inference_model":       true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, nil)

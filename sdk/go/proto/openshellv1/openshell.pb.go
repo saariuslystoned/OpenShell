@@ -112,6 +112,9 @@ const (
 	// OpenAI's public Codex/ChatGPT subscription OAuth refresh contract. The
 	// gateway pins the issuer/client and never accepts a caller-supplied token URL.
 	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH ProviderCredentialRefreshStrategy = 7
+	// xAI's experimental Grok subscription OAuth refresh contract. The gateway
+	// pins the issuer/client/scopes and never accepts caller-supplied authority.
+	ProviderCredentialRefreshStrategy_PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH ProviderCredentialRefreshStrategy = 8
 )
 
 // Enum value maps for ProviderCredentialRefreshStrategy.
@@ -125,6 +128,7 @@ var (
 		5: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT",
 		6: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE",
 		7: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH",
+		8: "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH",
 	}
 	ProviderCredentialRefreshStrategy_value = map[string]int32{
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED":                0,
@@ -135,6 +139,7 @@ var (
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT": 5,
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE":        6,
 		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH":         7,
+		"PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH":             8,
 	}
 )
 
@@ -1096,8 +1101,14 @@ type SandboxSpec struct {
 	// Portable resource requirements used by the gateway for driver selection
 	// and by drivers for provisioning.
 	ResourceRequirements *ResourceRequirements `protobuf:"bytes,9,opt,name=resource_requirements,json=resourceRequirements,proto3" json:"resource_requirements,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Optional sandbox-local inference provider selection. When set, this exact
+	// provider must also appear in `providers`; it overrides the workspace route
+	// for this sandbox without consulting attachment order.
+	InferenceProvider string `protobuf:"bytes,12,opt,name=inference_provider,json=inferenceProvider,proto3" json:"inference_provider,omitempty"`
+	// Model paired with `inference_provider`. Both fields must be set together.
+	InferenceModel string `protobuf:"bytes,13,opt,name=inference_model,json=inferenceModel,proto3" json:"inference_model,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *SandboxSpec) Reset() {
@@ -1170,6 +1181,20 @@ func (x *SandboxSpec) GetResourceRequirements() *ResourceRequirements {
 		return x.ResourceRequirements
 	}
 	return nil
+}
+
+func (x *SandboxSpec) GetInferenceProvider() string {
+	if x != nil {
+		return x.InferenceProvider
+	}
+	return ""
+}
+
+func (x *SandboxSpec) GetInferenceModel() string {
+	if x != nil {
+		return x.InferenceModel
+	}
+	return ""
 }
 
 type ResourceRequirements struct {
@@ -6366,7 +6391,8 @@ type DeleteProviderRefreshRequest struct {
 	// Workspace scope. Empty defaults to "default".
 	Workspace string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
 	// Revoke a supported OAuth grant at its pinned authority before deleting the
-	// local refresh state. Currently supported only by openai_codex_oauth.
+	// local refresh state. Supported only by reviewed subscription OAuth
+	// strategies with pinned remote revocation authorities.
 	RevokeRemote bool `protobuf:"varint,4,opt,name=revoke_remote,json=revokeRemote,proto3" json:"revoke_remote,omitempty"`
 	// Remove the primary minted credential after successful revocation.
 	ClearCredential bool `protobuf:"varint,5,opt,name=clear_credential,json=clearCredential,proto3" json:"clear_credential,omitempty"`
@@ -13091,14 +13117,16 @@ const file_openshell_proto_rawDesc = "" +
 	"\aSandbox\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12-\n" +
 	"\x04spec\x18\x02 \x01(\v2\x19.openshell.v1.SandboxSpecR\x04spec\x123\n" +
-	"\x06status\x18\x03 \x01(\v2\x1b.openshell.v1.SandboxStatusR\x06statusJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\x05phaseR\x16current_policy_version\"\xd7\x03\n" +
+	"\x06status\x18\x03 \x01(\v2\x1b.openshell.v1.SandboxStatusR\x06statusJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\x05phaseR\x16current_policy_version\"\xaf\x04\n" +
 	"\vSandboxSpec\x12\x1b\n" +
 	"\tlog_level\x18\x01 \x01(\tR\blogLevel\x12L\n" +
 	"\venvironment\x18\x05 \x03(\v2*.openshell.v1.SandboxSpec.EnvironmentEntryR\venvironment\x129\n" +
 	"\btemplate\x18\x06 \x01(\v2\x1d.openshell.v1.SandboxTemplateR\btemplate\x12;\n" +
 	"\x06policy\x18\a \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x1c\n" +
 	"\tproviders\x18\b \x03(\tR\tproviders\x12W\n" +
-	"\x15resource_requirements\x18\t \x01(\v2\".openshell.v1.ResourceRequirementsR\x14resourceRequirements\x1a>\n" +
+	"\x15resource_requirements\x18\t \x01(\v2\".openshell.v1.ResourceRequirementsR\x14resourceRequirements\x12-\n" +
+	"\x12inference_provider\x18\f \x01(\tR\x11inferenceProvider\x12'\n" +
+	"\x0finference_model\x18\r \x01(\tR\x0einferenceModel\x1a>\n" +
 	"\x10EnvironmentEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\n" +
@@ -14061,7 +14089,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x15SANDBOX_PHASE_UNKNOWN\x10\x05\x12\x1a\n" +
 	"\x16SANDBOX_PHASE_STOPPING\x10\x06\x12\x19\n" +
 	"\x15SANDBOX_PHASE_STOPPED\x10\a\x12\x1a\n" +
-	"\x16SANDBOX_PHASE_STARTING\x10\b*\x80\x04\n" +
+	"\x16SANDBOX_PHASE_STARTING\x10\b*\xb9\x04\n" +
 	"!ProviderCredentialRefreshStrategy\x124\n" +
 	"0PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED\x10\x00\x12/\n" +
 	"+PROVIDER_CREDENTIAL_REFRESH_STRATEGY_STATIC\x10\x01\x121\n" +
@@ -14070,7 +14098,8 @@ const file_openshell_proto_rawDesc = "" +
 	">PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS\x10\x04\x12C\n" +
 	"?PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT\x10\x05\x12<\n" +
 	"8PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE\x10\x06\x12;\n" +
-	"7PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH\x10\a*\xdb\x02\n" +
+	"7PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH\x10\a\x127\n" +
+	"3PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH\x10\b*\xdb\x02\n" +
 	"\x17ProviderProfileCategory\x12)\n" +
 	"%PROVIDER_PROFILE_CATEGORY_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fPROVIDER_PROFILE_CATEGORY_OTHER\x10\x01\x12'\n" +

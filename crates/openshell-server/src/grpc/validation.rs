@@ -185,6 +185,33 @@ pub(super) fn validate_sandbox_spec(
         )));
     }
 
+    let inference_provider = spec.inference_provider.trim();
+    let inference_model = spec.inference_model.trim();
+    if inference_provider.is_empty() != inference_model.is_empty() {
+        return Err(Status::invalid_argument(
+            "inference_provider and inference_model must be set together",
+        ));
+    }
+    if !inference_provider.is_empty() {
+        validate_dns1123_label(inference_provider, "inference_provider")?;
+        if !spec
+            .providers
+            .iter()
+            .any(|provider| provider == inference_provider)
+        {
+            return Err(Status::invalid_argument(
+                "inference_provider must name an attached provider",
+            ));
+        }
+        if inference_model.len() > MAX_MAP_VALUE_LEN
+            || inference_model.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument(
+                "inference_model is invalid or exceeds the maximum length",
+            ));
+        }
+    }
+
     // --- spec.log_level ---
     if spec.log_level.len() > MAX_LOG_LEVEL_LEN {
         return Err(Status::invalid_argument(format!(
@@ -1075,6 +1102,38 @@ mod tests {
         let err = validate_sandbox_spec("ok", &spec).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("providers"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_explicit_attached_inference_selection() {
+        let spec = SandboxSpec {
+            providers: vec![
+                "codex-subscription".to_string(),
+                "grok-subscription".to_string(),
+            ],
+            inference_provider: "grok-subscription".to_string(),
+            inference_model: "grok-4.6".to_string(),
+            ..default_spec()
+        };
+        assert!(validate_sandbox_spec("dual-provider", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_partial_or_unattached_inference_selection() {
+        let partial = SandboxSpec {
+            providers: vec!["grok-subscription".to_string()],
+            inference_provider: "grok-subscription".to_string(),
+            ..default_spec()
+        };
+        assert!(validate_sandbox_spec("partial", &partial).is_err());
+
+        let unattached = SandboxSpec {
+            providers: vec!["codex-subscription".to_string()],
+            inference_provider: "grok-subscription".to_string(),
+            inference_model: "grok-4.6".to_string(),
+            ..default_spec()
+        };
+        assert!(validate_sandbox_spec("unattached", &unattached).is_err());
     }
 
     #[test]

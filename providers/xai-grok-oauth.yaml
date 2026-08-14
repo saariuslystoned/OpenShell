@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: xai-grok-oauth
+display_name: xAI Grok Subscription (Experimental)
+description: Separate gateway-managed xAI grant for Grok subscription inference
+category: inference
+inference_capable: true
+credentials:
+  # Deliberately has no env_vars. The gateway/supervisor route consumes this
+  # credential, but provider environment resolution never injects it into the
+  # sandbox workload.
+  - name: XAI_GROK_ACCESS_TOKEN
+    description: Gateway-only xAI Grok subscription access token
+    required: true
+    refresh:
+      strategy: xai_grok_oauth
+      token_url: https://auth.x.ai/oauth2/token
+      scopes: [openid, profile, email, offline_access, api:access, grok-cli:access]
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      material:
+        - name: refresh_token
+          description: xAI refresh token managed exclusively by the OpenShell gateway
+          required: true
+          secret: true
+discovery:
+  credentials: []
+# This provider grants no direct sandbox egress. Subscription traffic is
+# available only through the attached sandbox's inference.local route.
+endpoints: []
+binaries: []

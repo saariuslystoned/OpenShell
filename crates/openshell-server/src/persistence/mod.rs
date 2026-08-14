@@ -339,6 +339,38 @@ impl Store {
         ))
     }
 
+    /// Insert a scoped object only when its workspace/name identity is absent.
+    ///
+    /// Unlike `put_scoped`, this never overwrites a concurrent owner. It is the
+    /// scoped counterpart to `put_if(..., MustCreate)` for records whose scope
+    /// is required by later provider-owned enumeration and cleanup.
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.create_scoped", otel.status_code = tracing::field::Empty, object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, scope = %scope)
+    )]
+    pub async fn create_scoped(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        scope: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        store_dispatch_traced!(self.create_scoped(
+            object_type,
+            id,
+            name,
+            workspace,
+            scope,
+            payload,
+            labels
+        ))
+    }
+
     /// Fetch an object by id.
     #[tracing::instrument(
         name = "store",

@@ -1870,6 +1870,52 @@ async fn list_by_scope_returns_resource_version() {
         "list_by_scope must return the actual resource_version, not a default"
     );
 }
+
+#[tokio::test]
+async fn create_scoped_is_insert_only_and_preserves_owner_scope() {
+    let store = test_store().await;
+    let created = store
+        .create_scoped(
+            "provider_credential_refresh_state",
+            "refresh-generation-a",
+            "provider-refresh-shared-name",
+            "default",
+            "provider-owner-id",
+            b"generation-a",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.resource_version, 1);
+
+    let collision = store
+        .create_scoped(
+            "provider_credential_refresh_state",
+            "refresh-generation-b",
+            "provider-refresh-shared-name",
+            "default",
+            "provider-owner-id",
+            b"generation-b",
+            None,
+        )
+        .await
+        .expect_err("a concurrent generation must not overwrite the first");
+    assert!(collision.is_expected());
+
+    let records = store
+        .list_by_scope(
+            "provider_credential_refresh_state",
+            "provider-owner-id",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, "refresh-generation-a");
+    assert_eq!(records[0].payload, b"generation-a");
+}
+
 #[tokio::test]
 async fn membership_and_label_selector_filters_both() {
     let store = test_store().await;

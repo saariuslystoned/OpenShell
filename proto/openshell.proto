@@ -807,6 +807,12 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+  // Optional sandbox-local inference provider selection. When set, this exact
+  // provider must also appear in `providers`; it overrides the workspace route
+  // for this sandbox without consulting attachment order.
+  string inference_provider = 12;
+  // Model paired with `inference_provider`. Both fields must be set together.
+  string inference_model = 13;
 }
 
 message ResourceRequirements {
@@ -1519,6 +1525,9 @@ enum ProviderCredentialRefreshStrategy {
   // OpenAI's public Codex/ChatGPT subscription OAuth refresh contract. The
   // gateway pins the issuer/client and never accepts a caller-supplied token URL.
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH = 7;
+  // xAI's experimental Grok subscription OAuth refresh contract. The gateway
+  // pins the issuer/client/scopes and never accepts caller-supplied authority.
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH = 8;
 }
 
 message ProviderCredentialRefreshMaterial {
@@ -1640,7 +1649,8 @@ message DeleteProviderRefreshRequest {
   // Workspace scope. Empty defaults to "default".
   string workspace = 3;
   // Revoke a supported OAuth grant at its pinned authority before deleting the
-  // local refresh state. Currently supported only by openai_codex_oauth.
+  // local refresh state. Supported only by reviewed subscription OAuth
+  // strategies with pinned remote revocation authorities.
   bool revoke_remote = 4;
   // Remove the primary minted credential after successful revocation.
   bool clear_credential = 5;

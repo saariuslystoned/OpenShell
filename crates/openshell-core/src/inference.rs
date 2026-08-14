@@ -3,6 +3,8 @@
 
 use std::collections::HashSet;
 
+use crate::subscription_oauth;
+
 // ---------------------------------------------------------------------------
 // Auth header abstraction
 // ---------------------------------------------------------------------------
@@ -101,18 +103,30 @@ static OPENAI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     requires_provider_attachment: false,
 };
 
-const OPENAI_CODEX_OAUTH_PROTOCOLS: &[&str] = &["openai_responses"];
-
 /// Experimental subscription-backed Codex route. Its endpoint and request
 /// shape are intentionally centralized and have no operator override.
 static OPENAI_CODEX_OAUTH_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
-    provider_type: "openai-codex-oauth",
-    default_base_url: "https://chatgpt.com/backend-api/codex",
-    protocols: OPENAI_CODEX_OAUTH_PROTOCOLS,
-    credential_key_names: &["OPENAI_CODEX_OAUTH_ACCESS_TOKEN"],
+    provider_type: subscription_oauth::OPENAI_CODEX_PROVIDER_TYPE,
+    default_base_url: subscription_oauth::OPENAI_CODEX_INFERENCE_BASE_URL,
+    protocols: subscription_oauth::OPENAI_CODEX_INFERENCE_PROTOCOLS,
+    credential_key_names: &[subscription_oauth::OPENAI_CODEX_ACCESS_TOKEN_KEY],
     base_url_config_keys: &[],
     auth: AuthHeader::Bearer,
-    default_headers: &[("originator", "openshell")],
+    default_headers: subscription_oauth::OPENAI_CODEX_ROUTE_HEADERS,
+    passthrough_headers: &[],
+    requires_provider_attachment: true,
+};
+
+// This first xAI surface is intentionally limited to route shapes exercised by
+// the attended Grok/OpenClaw proof. Widen only with provider evidence.
+static XAI_GROK_OAUTH_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+    default_base_url: subscription_oauth::XAI_GROK_INFERENCE_BASE_URL,
+    protocols: subscription_oauth::XAI_GROK_INFERENCE_PROTOCOLS,
+    credential_key_names: &[subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY],
+    base_url_config_keys: &[],
+    auth: AuthHeader::Bearer,
+    default_headers: subscription_oauth::XAI_GROK_ROUTE_HEADERS,
     passthrough_headers: &[],
     requires_provider_attachment: true,
 };
@@ -242,9 +256,11 @@ static AWS_BEDROCK_PROFILE: InferenceProviderProfile = InferenceProviderProfile 
 /// [`profile_for`] and `openshell-providers` normalization agree.
 #[must_use]
 pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
+    if let Some(provider_type) = subscription_oauth::normalize_provider_type(input) {
+        return Some(provider_type);
+    }
     match input.trim().to_ascii_lowercase().as_str() {
         "openai" => Some("openai"),
-        "openai-codex-oauth" | "codex-subscription" => Some("openai-codex-oauth"),
         "anthropic" => Some("anthropic"),
         "nvidia" => Some("nvidia"),
         "deepinfra" => Some("deepinfra"),
@@ -264,6 +280,7 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
     match normalize_inference_provider_type(provider_type)? {
         "openai" => Some(&OPENAI_PROFILE),
         "openai-codex-oauth" => Some(&OPENAI_CODEX_OAUTH_PROFILE),
+        "xai-grok-oauth" => Some(&XAI_GROK_OAUTH_PROFILE),
         "anthropic" => Some(&ANTHROPIC_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
         "deepinfra" => Some(&DEEPINFRA_PROFILE),
@@ -392,6 +409,33 @@ mod tests {
         assert!(profile_for("aws-bedrock").is_some());
         assert!(profile_for("OpenAI").is_some()); // case insensitive
         assert!(profile_for("AWS-Bedrock").is_some()); // case insensitive
+        assert!(profile_for("codex-subscription").is_some());
+        assert!(profile_for("grok-subscription").is_some());
+    }
+
+    #[test]
+    fn subscription_profiles_are_pinned_attachment_scoped_and_narrow() {
+        let codex = profile_for("codex-subscription").expect("Codex profile");
+        assert_eq!(
+            codex.default_base_url,
+            subscription_oauth::OPENAI_CODEX_INFERENCE_BASE_URL
+        );
+        assert_eq!(codex.protocols, &["openai_responses"]);
+        assert!(codex.base_url_config_keys.is_empty());
+        assert!(codex.requires_provider_attachment);
+
+        let grok = profile_for("grok-subscription").expect("Grok profile");
+        assert_eq!(
+            grok.default_base_url,
+            subscription_oauth::XAI_GROK_INFERENCE_BASE_URL
+        );
+        assert_eq!(
+            grok.protocols,
+            &["openai_chat_completions", "model_discovery"]
+        );
+        assert!(grok.base_url_config_keys.is_empty());
+        assert!(grok.passthrough_headers.is_empty());
+        assert!(grok.requires_provider_attachment);
     }
 
     #[test]

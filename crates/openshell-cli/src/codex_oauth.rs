@@ -7,15 +7,14 @@
 //! never reads or imports Codex CLI/Desktop credential stores.
 
 use base64::Engine as _;
-use miette::{IntoDiagnostic, Result, miette};
+use miette::{Result, miette};
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::time::{Duration, Instant};
 
-const OPENAI_AUTH_BASE_URL: &str = "https://auth.openai.com";
-const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+use openshell_core::subscription_oauth::{OPENAI_CODEX_AUTH_BASE_URL, OPENAI_CODEX_CLIENT_ID};
+
 const DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub struct DeviceCode {
     pub verification_url: String,
@@ -101,44 +100,12 @@ struct AuthClaims {
     chatgpt_account_is_fedramp: bool,
 }
 
-fn client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .into_diagnostic()
-}
-
-async fn bounded_json<T: for<'de> Deserialize<'de>>(
-    mut response: reqwest::Response,
-    invalid_message: &'static str,
-) -> Result<T> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_OAUTH_RESPONSE_BYTES as u64)
-    {
-        return Err(miette!(invalid_message));
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| miette!(invalid_message))?
-    {
-        if bytes.len().saturating_add(chunk.len()) > MAX_OAUTH_RESPONSE_BYTES {
-            return Err(miette!(invalid_message));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    serde_json::from_slice(&bytes).map_err(|_| miette!(invalid_message))
-}
-
 pub async fn request_device_code() -> Result<DeviceCode> {
-    request_device_code_at(OPENAI_AUTH_BASE_URL).await
+    request_device_code_at(OPENAI_CODEX_AUTH_BASE_URL).await
 }
 
 async fn request_device_code_at(auth_base_url: &str) -> Result<DeviceCode> {
-    let response = client()?
+    let response = crate::oauth_http::client()?
         .post(format!(
             "{}/api/accounts/deviceauth/usercode",
             auth_base_url.trim_end_matches('/')
@@ -156,13 +123,13 @@ async fn request_device_code_at(auth_base_url: &str) -> Result<DeviceCode> {
             response.status().as_u16()
         ));
     }
-    let response: UserCodeResponse = bounded_json(
+    let response: UserCodeResponse = crate::oauth_http::bounded_json(
         response,
         "OpenAI Codex returned an invalid device authorization response",
     )
     .await?;
     if response.device_auth_id.trim().is_empty()
-        || response.user_code.trim().is_empty()
+        || !valid_display_code(&response.user_code)
         || response.interval == 0
     {
         return Err(miette!(
@@ -187,8 +154,16 @@ pub async fn complete_device_code(device: DeviceCode) -> Result<OpenAiCodexGrant
 /// Production revocation after configuration is performed by the gateway so
 /// the CLI never has to retrieve stored refresh material.
 pub async fn revoke_unclaimed_grant(refresh_token: &str) -> Result<()> {
-    let response = client()?
-        .post(format!("{OPENAI_AUTH_BASE_URL}/oauth/revoke"))
+    revoke_unclaimed_grant_at(
+        openshell_core::subscription_oauth::OPENAI_CODEX_REVOCATION_URL,
+        refresh_token,
+    )
+    .await
+}
+
+async fn revoke_unclaimed_grant_at(endpoint: &str, refresh_token: &str) -> Result<()> {
+    let response = crate::oauth_http::client()?
+        .post(endpoint)
         .header("originator", "openshell")
         .json(&RevokeRequest {
             token: refresh_token,
@@ -198,12 +173,32 @@ pub async fn revoke_unclaimed_grant(refresh_token: &str) -> Result<()> {
         .send()
         .await
         .map_err(|_| miette!("could not revoke the unused OpenAI Codex grant"))?;
-    if response.status().is_success() {
+    let status = response.status();
+    let body = crate::oauth_http::bounded_bytes(
+        response,
+        "OpenAI Codex returned an invalid revocation response",
+    )
+    .await?;
+    if status.is_success()
+        || (matches!(
+            status,
+            StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) && matches!(
+            crate::oauth_http::error_code(&body).as_deref(),
+            Some(
+                "invalid_token"
+                    | "invalid_grant"
+                    | "refresh_token_expired"
+                    | "refresh_token_reused"
+                    | "refresh_token_invalidated"
+            )
+        ))
+    {
         return Ok(());
     }
     Err(miette!(
         "OpenAI Codex grant revocation was rejected (HTTP {})",
-        response.status().as_u16()
+        status.as_u16()
     ))
 }
 
@@ -211,10 +206,13 @@ async fn complete_device_code_with_timeout(
     device: DeviceCode,
     timeout: Duration,
 ) -> Result<OpenAiCodexGrant> {
-    let client = client()?;
+    let client = crate::oauth_http::client()?;
     let poll_url = format!("{}/api/accounts/deviceauth/token", device.auth_base_url);
     let started = Instant::now();
     let code = loop {
+        if started.elapsed() >= timeout {
+            return Err(miette!("OpenAI Codex device authorization timed out"));
+        }
         let response = client
             .post(&poll_url)
             .header("originator", "openshell")
@@ -226,7 +224,7 @@ async fn complete_device_code_with_timeout(
             .await
             .map_err(|_| miette!("OpenAI Codex device authorization poll failed"))?;
         if response.status().is_success() {
-            let code: TokenPollResponse = bounded_json(
+            let code: TokenPollResponse = crate::oauth_http::bounded_json(
                 response,
                 "OpenAI Codex returned an invalid authorization response",
             )
@@ -246,9 +244,6 @@ async fn complete_device_code_with_timeout(
                 "OpenAI Codex device authorization failed (HTTP {})",
                 response.status().as_u16()
             ));
-        }
-        if started.elapsed() >= timeout {
-            return Err(miette!("OpenAI Codex device authorization timed out"));
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         tokio::time::sleep(device.interval.min(remaining)).await;
@@ -274,8 +269,11 @@ async fn complete_device_code_with_timeout(
             response.status().as_u16()
         ));
     }
-    let tokens: TokenExchangeResponse =
-        bounded_json(response, "OpenAI Codex returned an invalid token response").await?;
+    let tokens: TokenExchangeResponse = crate::oauth_http::bounded_json(
+        response,
+        "OpenAI Codex returned an invalid token response",
+    )
+    .await?;
     if tokens.access_token.trim().is_empty() || tokens.refresh_token.trim().is_empty() {
         return Err(miette!(
             "OpenAI Codex returned an incomplete token response"
@@ -287,6 +285,13 @@ async fn complete_device_code_with_timeout(
         account_id,
         fedramp,
     })
+}
+
+fn valid_display_code(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
 fn parse_account_claims(id_token: &str) -> Result<(String, bool)> {
@@ -441,7 +446,7 @@ mod tests {
         let server = MockServer::start().await;
         let canary = format!(
             "oversized-secret-canary{}",
-            "x".repeat(MAX_OAUTH_RESPONSE_BYTES)
+            "x".repeat(openshell_core::subscription_oauth::MAX_RESPONSE_BYTES)
         );
         Mock::given(method("POST"))
             .and(path("/api/accounts/deviceauth/usercode"))
@@ -455,5 +460,90 @@ mod tests {
         };
         assert!(error.to_string().contains("invalid device authorization"));
         assert!(!error.to_string().contains("oversized-secret-canary"));
+    }
+
+    #[tokio::test]
+    async fn device_flow_rejects_control_characters_in_displayed_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/usercode"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_auth_id": "device-auth-id",
+                "user_code": "ABCD\nINJECTED",
+                "interval": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let Err(error) = request_device_code_at(&server.uri()).await else {
+            panic!("control characters in an attended code must be rejected");
+        };
+        assert!(error.to_string().contains("incomplete"));
+        assert!(!error.to_string().contains("INJECTED"));
+    }
+
+    #[tokio::test]
+    async fn unclaimed_grant_revoke_is_bounded_redirect_denying_and_idempotent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/already-dead"))
+            .and(header("originator", "openshell"))
+            .and(body_string_contains("refresh-token-canary"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "response-secret-canary"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        revoke_unclaimed_grant_at(
+            &format!("{}/already-dead", server.uri()),
+            "refresh-token-canary",
+        )
+        .await
+        .expect("an already-dead grant is a converged revoke");
+
+        Mock::given(method("POST"))
+            .and(path("/transient"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "transient-response-secret-canary"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let transient = revoke_unclaimed_grant_at(
+            &format!("{}/transient", server.uri()),
+            "refresh-token-canary",
+        )
+        .await
+        .expect_err("a server failure must remain retryable regardless of its body");
+        assert!(transient.to_string().contains("HTTP 500"));
+        assert!(
+            !transient
+                .to_string()
+                .contains("transient-response-secret-canary")
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "https://attacker.invalid/steal")
+                    .set_body_string("redirect-secret-canary"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = revoke_unclaimed_grant_at(
+            &format!("{}/redirect", server.uri()),
+            "refresh-token-canary",
+        )
+        .await
+        .expect_err("redirects must not be followed");
+        assert!(error.to_string().contains("HTTP 302"));
+        assert!(!error.to_string().contains("redirect-secret-canary"));
+        assert!(!error.to_string().contains("attacker.invalid"));
     }
 }

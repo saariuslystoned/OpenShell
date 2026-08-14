@@ -65,22 +65,27 @@ the gateway's reviewed OAuth lifecycle. The gateway also rejects generic OAuth
 refresh strategies for this provider; only the dedicated
 `openai_codex_oauth` strategy can activate its route.
 
-## Attach and route
+## Attach and Route
 
-Attach the provider only to sandboxes that should use the subscription:
-
-```shell
-openshell sandbox provider attach my-sandbox codex-subscription
-```
-
-Then configure the gateway inference route with a Codex model available to the
-selected ChatGPT workspace:
+Attach and select the provider while creating a sandbox. Choose a Codex model
+available to the signed-in ChatGPT workspace:
 
 ```shell
-openshell inference set \
+openshell sandbox create \
+  --name codex-agent \
   --provider codex-subscription \
-  --model <supported-codex-model>
+  --inference-provider codex-subscription \
+  --inference-model <supported-codex-model>
 ```
+
+Provider and model selection are paired, explicit, and sandbox-local. If Codex
+and Grok are both attached, OpenShell never chooses by attachment order and
+never falls through to the other provider when the selected grant is unusable.
+
+`openshell inference set` remains the workspace-default compatibility path for
+sandboxes created without a local selection. An attached subscription provider
+must still match that route exactly; an unavailable selected/default grant does
+not expose another attached personal grant as a fallback.
 
 The provider contributes no direct network endpoint to the sandbox. Calls to
 OpenAI hosts remain governed by the sandbox's ordinary network policy; the
@@ -93,8 +98,11 @@ The gateway refreshes the access token before expiry and binds refreshed tokens
 to the same ChatGPT account/workspace identifier. It refuses an unexpected
 account switch. The local routing lifetime is capped at one hour even if a token
 claims a later expiry. A terminal refresh rejection marks the grant as requiring
-a new sign-in; transient timeouts, rate limits, and server failures are retried
-without printing the upstream response body.
+a new sign-in. Clear HTTP timeout, rate-limit, and server-error responses remain
+retryable without printing the upstream response body. A post-connect transport
+failure, unreadable successful response, or expired in-progress rotation lease
+is treated as an ambiguous consumed-token outcome and requires a new attended
+grant; OpenShell never retries that predecessor refresh token.
 
 An in-progress, refresh-failed, expired, revoked, failed-revocation, or
 reauthorization-required grant is not published as an inference route. The
@@ -116,8 +124,9 @@ openshell provider logout --name codex-subscription
 
 Logout fences refresh first, calls the pinned OpenAI revocation authority, then
 clears the local credential and refresh state. If remote revocation fails, the
-grant remains locally unavailable and retryable; OpenShell does not silently
-delete the state or resume routing it.
+locally usable bearer is still cleared while the grant generation and refresh
+material remain unavailable and retryable in a `revoke_failed` record. OpenShell
+does not silently delete that retry receipt or resume routing it.
 
 After logout, detach or delete the now-inactive provider according to your
 normal provider lifecycle. OpenShell refuses a generic `provider delete` while
@@ -142,4 +151,6 @@ orphan the remote authorization.
 
 For the general managed-inference path, refer to
 [Inference Routing](/sandboxes/inference-routing). For provider attachment and
-profile composition, refer to [Providers v2](/sandboxes/providers-v2).
+profile composition, refer to [Providers v2](/sandboxes/providers-v2). For the
+other subscription adapter, refer to
+[xAI Grok Subscription](/providers/xai-grok-subscription).

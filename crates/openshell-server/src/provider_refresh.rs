@@ -12,6 +12,7 @@ use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
     StoredProviderCredentialRefreshState,
 };
+use openshell_core::subscription_oauth;
 use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -24,11 +25,17 @@ const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
 const REFRESH_ERROR_RETRY_SECONDS: i64 = 60;
 const REFRESH_WORKER_PAGE_SIZE: u32 = 1000;
-pub const OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY: &str = "OPENAI_CODEX_OAUTH_ACCESS_TOKEN";
-const MAX_OPENAI_CODEX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
-pub const OPENAI_CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-pub const OPENAI_CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const OPENAI_CODEX_OAUTH_REVOKE_URL: &str = "https://auth.openai.com/oauth/revoke";
+const SUBSCRIPTION_REMOTE_OPERATION_LEASE_SECONDS: i64 =
+    subscription_oauth::HTTP_TIMEOUT_SECONDS.cast_signed() + 30;
+#[cfg(test)]
+pub const OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY: &str =
+    subscription_oauth::OPENAI_CODEX_ACCESS_TOKEN_KEY;
+#[cfg(test)]
+pub const OPENAI_CODEX_OAUTH_CLIENT_ID: &str = subscription_oauth::OPENAI_CODEX_CLIENT_ID;
+#[cfg(test)]
+pub const OPENAI_CODEX_OAUTH_TOKEN_URL: &str = subscription_oauth::OPENAI_CODEX_TOKEN_URL;
+#[cfg(test)]
+const MAX_OPENAI_CODEX_OAUTH_RESPONSE_BYTES: usize = subscription_oauth::MAX_RESPONSE_BYTES;
 
 impl ObjectType for StoredProviderCredentialRefreshState {
     fn object_type() -> &'static str {
@@ -45,6 +52,7 @@ pub fn refresh_state_name(provider_id: &str, credential_key: &str) -> String {
     format!("provider-refresh-{provider_id}-{key}")
 }
 
+#[cfg(test)]
 pub async fn put_refresh_state(
     store: &Store,
     state: &StoredProviderCredentialRefreshState,
@@ -53,6 +61,33 @@ pub async fn put_refresh_state(
         .put_scoped_message(state, &state.provider_id)
         .await
         .map_err(|e| Status::internal(format!("persist provider refresh state failed: {e}")))
+}
+
+/// Create the first refresh generation without overwriting a concurrent
+/// configure from another gateway process. The provider id remains the durable
+/// scope used by grant enumeration and generic-delete protection.
+pub async fn create_refresh_state_if_absent(
+    store: &Store,
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<Option<u64>, Status> {
+    match store
+        .create_scoped(
+            StoredProviderCredentialRefreshState::object_type(),
+            state.object_id(),
+            state.object_name(),
+            state.object_workspace(),
+            &state.provider_id,
+            &state.encode_to_vec(),
+            None,
+        )
+        .await
+    {
+        Ok(result) => Ok(Some(result.resource_version)),
+        Err(PersistenceError::UniqueViolation { .. }) => Ok(None),
+        Err(error) => Err(Status::internal(format!(
+            "persist provider refresh state failed: {error}"
+        ))),
+    }
 }
 
 /// Persist an updated refresh state only if the row still exists with the
@@ -281,13 +316,53 @@ pub fn new_refresh_state(
     })
 }
 
-#[derive(Debug)]
 struct MintedCredential {
     access_token: String,
     expires_at_ms: i64,
     refresh_token: Option<String>,
     additional_credentials: HashMap<String, String>,
     material_updates: HashMap<String, String>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for MintedCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MintedCredential")
+            .field("access_token", &"[redacted]")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("refresh_token_present", &self.refresh_token.is_some())
+            .field(
+                "additional_credential_count",
+                &self.additional_credentials.len(),
+            )
+            .field("material_update_count", &self.material_updates.len())
+            .finish()
+    }
+}
+
+/// Exact provider-side material written by one refresh publication attempt.
+///
+/// This deliberately does not implement `Debug`: inline values are bearer
+/// credentials. The receipt exists only so a losing subscription refresh can
+/// conditionally remove its own publication after a concurrent logout (or
+/// newer refresh generation) supersedes the final state transition.
+struct AppliedCredentialReceipt {
+    inline_values: HashMap<String, String>,
+    handles: HashMap<String, CredentialHandle>,
+    expires_at_ms: i64,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for AppliedCredentialReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppliedCredentialReceipt")
+            .field("inline_value_count", &self.inline_values.len())
+            .field("handle_count", &self.handles.len())
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -343,6 +418,7 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::OpenaiCodexOauth => "openai_codex_oauth",
+        ProviderCredentialRefreshStrategy::XaiGrokOauth => "xai_grok_oauth",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -382,17 +458,49 @@ async fn refresh_provider_credential_inner(
     // Generation of the refresh at the start of the rotation. Terminal persists
     // match on it so a concurrent delete or rotation is detected rather than
     // clobbered, and a deleted refresh is never recreated (CWE-362).
-    let expected_version = state
+    let mut expected_version = state
         .metadata
         .as_ref()
         .map_or(0, |meta| meta.resource_version);
 
-    if ProviderCredentialRefreshStrategy::try_from(state.strategy)
-        == Ok(ProviderCredentialRefreshStrategy::OpenaiCodexOauth)
-        && matches!(state.status.as_str(), "revoking" | "revoke_failed")
-    {
+    let managed_subscription = ProviderCredentialRefreshStrategy::try_from(state.strategy)
+        .is_ok_and(subscription_oauth::is_managed_strategy);
+    if managed_subscription && state.status == "reauth_required" {
         return Err(Status::failed_precondition(
-            "OpenAI Codex grant revocation is pending",
+            "subscription OAuth authorization requires provider login",
+        ));
+    }
+    if managed_subscription && matches!(state.status.as_str(), "revoking" | "revoke_failed") {
+        return Err(Status::failed_precondition(
+            "subscription OAuth grant revocation is pending",
+        ));
+    }
+    if managed_subscription && state.status == "rotating" {
+        if state.next_refresh_at_ms > current_time_ms() {
+            return Err(Status::aborted(
+                "subscription OAuth rotation is already in progress",
+            ));
+        }
+
+        // A lease that expired while the row remained `rotating` is an
+        // ambiguous-consumption event: the authority may have spent and
+        // rotated the refresh token before the process died. Reusing the
+        // predecessor can trigger token-family revocation. Fail closed and
+        // require a distinct attended grant instead of making another remote
+        // request with material whose consumption state is unknowable.
+        state.status = "reauth_required".to_string();
+        state.last_error =
+            "subscription OAuth rotation outcome is unknown; provider login is required"
+                .to_string();
+        state.next_refresh_at_ms = 0;
+        let Some(_) = persist_refresh_state_if_current(store, &state, expected_version).await?
+        else {
+            return Err(Status::aborted(
+                "subscription OAuth refresh changed while fencing an ambiguous rotation",
+            ));
+        };
+        return Err(Status::failed_precondition(
+            "subscription OAuth rotation outcome is unknown; provider login is required",
         ));
     }
 
@@ -427,11 +535,30 @@ async fn refresh_provider_credential_inner(
         return Err(err);
     }
 
+    if managed_subscription {
+        let now_ms = current_time_ms();
+        state.status = "rotating".to_string();
+        state.next_refresh_at_ms =
+            now_ms.saturating_add(SUBSCRIPTION_REMOTE_OPERATION_LEASE_SECONDS.saturating_mul(1000));
+        state.last_error.clear();
+        let Some(claimed_version) =
+            persist_refresh_state_if_current(store, &state, expected_version).await?
+        else {
+            return Err(Status::aborted(
+                "subscription OAuth refresh changed while rotation started",
+            ));
+        };
+        if let Some(metadata) = state.metadata.as_mut() {
+            metadata.resource_version = claimed_version;
+        }
+        expected_version = claimed_version;
+    }
+
     match mint_credential(&state).await {
         Ok(minted) => {
             let now_ms = current_time_ms();
-            let codex_publish = ProviderCredentialRefreshStrategy::try_from(state.strategy)
-                == Ok(ProviderCredentialRefreshStrategy::OpenaiCodexOauth);
+            let subscription_publish = ProviderCredentialRefreshStrategy::try_from(state.strategy)
+                .is_ok_and(subscription_oauth::is_managed_strategy);
             if let Some(ref refresh_token) = minted.refresh_token {
                 state
                     .material
@@ -460,7 +587,7 @@ async fn refresh_provider_credential_inner(
             // unroutable state first, then mark it refreshed only after the
             // provider credential commit succeeds. This prevents a bundle read
             // from combining new account routing with the predecessor token.
-            state.status = if codex_publish {
+            state.status = if subscription_publish {
                 "publishing".to_string()
             } else {
                 "refreshed".to_string()
@@ -490,7 +617,7 @@ async fn refresh_provider_credential_inner(
             };
 
             // Generation is ours; write the minted credentials into the provider.
-            if let Err(err) = apply_minted_credential(
+            let applied_receipt = match apply_minted_credential(
                 store,
                 workspace,
                 credentials,
@@ -500,29 +627,55 @@ async fn refresh_provider_credential_inner(
             )
             .await
             {
-                state.status = "error".to_string();
-                state.last_error = err.message().to_string();
-                state.next_refresh_at_ms =
-                    now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000));
-                // Reflect the failure on the state we just wrote; skip silently
-                // if it was deleted concurrently (it is not recreated).
-                persist_refresh_state_if_current(store, &state, new_version).await?;
-                warn!(
-                    provider = %state.provider_name,
-                    credential_key = %state.credential_key,
-                    strategy = %refresh_strategy_name(state.strategy),
-                    status = %state.status,
-                    next_refresh_at_ms = state.next_refresh_at_ms,
-                    seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
-                    error = %err,
-                    "provider credential refresh errored"
-                );
-                return Err(err);
-            }
-            if codex_publish {
+                Ok(receipt) => receipt,
+                Err(err) => {
+                    state.status = "error".to_string();
+                    state.last_error = err.message().to_string();
+                    state.next_refresh_at_ms =
+                        now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000));
+                    // Reflect the failure on the state we just wrote; skip silently
+                    // if it was deleted concurrently (it is not recreated).
+                    persist_refresh_state_if_current(store, &state, new_version).await?;
+                    warn!(
+                        provider = %state.provider_name,
+                        credential_key = %state.credential_key,
+                        strategy = %refresh_strategy_name(state.strategy),
+                        status = %state.status,
+                        next_refresh_at_ms = state.next_refresh_at_ms,
+                        seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
+                        error = %err,
+                        "provider credential refresh errored"
+                    );
+                    return Err(err);
+                }
+            };
+            if subscription_publish {
                 state.status = "refreshed".to_string();
                 let Some(_) = persist_refresh_state_if_current(store, &state, new_version).await?
                 else {
+                    // The provider write and refresh-state write are separate
+                    // records. A concurrent logout can claim `revoking` after
+                    // the intermediate `publishing` state, clear the bearer,
+                    // and then lose a race to this provider write. Remove only
+                    // values/handles that still exactly match this mint so the
+                    // losing refresh cannot leave credential residue and can
+                    // never clobber a newer winner.
+                    if let Err(cleanup_error) = rollback_applied_minted_credential(
+                        store,
+                        credentials,
+                        &provider,
+                        &applied_receipt,
+                    )
+                    .await
+                    {
+                        warn!(
+                            provider = %state.provider_name,
+                            credential_key = %state.credential_key,
+                            strategy = %refresh_strategy_name(state.strategy),
+                            error = %cleanup_error,
+                            "failed to remove superseded subscription credential publication"
+                        );
+                    }
                     warn!(
                         provider = %state.provider_name,
                         credential_key = %state.credential_key,
@@ -548,16 +701,17 @@ async fn refresh_provider_credential_inner(
         }
         Err(err) => {
             let now_ms = current_time_ms();
-            let terminal_codex_grant = ProviderCredentialRefreshStrategy::try_from(state.strategy)
-                == Ok(ProviderCredentialRefreshStrategy::OpenaiCodexOauth)
-                && err.code() == tonic::Code::FailedPrecondition;
-            state.status = if terminal_codex_grant {
+            let terminal_subscription_grant =
+                ProviderCredentialRefreshStrategy::try_from(state.strategy)
+                    .is_ok_and(subscription_oauth::is_managed_strategy)
+                    && err.code() == tonic::Code::FailedPrecondition;
+            state.status = if terminal_subscription_grant {
                 "reauth_required".to_string()
             } else {
                 "error".to_string()
             };
             state.last_error = err.message().to_string();
-            state.next_refresh_at_ms = if terminal_codex_grant {
+            state.next_refresh_at_ms = if terminal_subscription_grant {
                 0
             } else {
                 now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000))
@@ -585,8 +739,11 @@ async fn apply_minted_credential(
     provider: &Provider,
     credential_key: &str,
     minted: &MintedCredential,
-) -> Result<(), Status> {
+) -> Result<AppliedCredentialReceipt, Status> {
     let mut updated = provider.clone();
+    let mut inline_values =
+        HashMap::from([(credential_key.to_string(), minted.access_token.clone())]);
+    inline_values.extend(minted.additional_credentials.clone());
     let staging_id = format!("{}-refresh-{}", provider.object_id(), uuid::Uuid::new_v4());
     let staged_handles = if let Some(credentials) = credentials
         && credentials.stores_provider_credentials()
@@ -732,7 +889,93 @@ async fn apply_minted_credential(
         // Don't fail the operation - the refresh succeeded, this is just cleanup
     }
 
-    cas_result
+    cas_result.map(|()| AppliedCredentialReceipt {
+        inline_values: if staged_handles.is_some() {
+            HashMap::new()
+        } else {
+            inline_values
+        },
+        handles: staged_handles.unwrap_or_default(),
+        expires_at_ms: minted.expires_at_ms,
+    })
+}
+
+fn receipt_expiry_matches(provider: &Provider, key: &str, expires_at_ms: i64) -> bool {
+    if expires_at_ms > 0 {
+        provider
+            .credential_expires_at_ms
+            .get(key)
+            .is_some_and(|current| *current == expires_at_ms)
+    } else {
+        !provider.credential_expires_at_ms.contains_key(key)
+    }
+}
+
+/// Remove a refresh publication only while the current provider still carries
+/// the exact inline values or opaque handles written by that attempt. The
+/// conditional comparison is evaluated inside the provider CAS closure, so a
+/// newer provider update is preserved. A small bounded retry handles an
+/// unrelated version race without turning cleanup into an unbounded worker.
+async fn rollback_applied_minted_credential(
+    store: &Store,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    provider: &Provider,
+    receipt: &AppliedCredentialReceipt,
+) -> Result<(), Status> {
+    const MAX_ROLLBACK_ATTEMPTS: usize = 3;
+
+    for attempt in 1..=MAX_ROLLBACK_ATTEMPTS {
+        let mut removed_handles = HashMap::new();
+        let result = store
+            .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
+                for (key, value) in &receipt.inline_values {
+                    if current.credentials.get(key) == Some(value)
+                        && receipt_expiry_matches(current, key, receipt.expires_at_ms)
+                    {
+                        current.credentials.remove(key);
+                        current.credential_expires_at_ms.remove(key);
+                    }
+                }
+                for (key, handle) in &receipt.handles {
+                    if current.credential_handles.get(key) == Some(handle)
+                        && receipt_expiry_matches(current, key, receipt.expires_at_ms)
+                    {
+                        current.credential_handles.remove(key);
+                        current.credential_expires_at_ms.remove(key);
+                        removed_handles.insert(key.clone(), handle.clone());
+                    }
+                }
+            })
+            .await;
+
+        match result {
+            Ok(_) => {
+                if !removed_handles.is_empty()
+                    && let Some(credentials) = credentials
+                {
+                    credentials
+                        .delete_provider_credential_handles(
+                            provider.object_name(),
+                            provider.object_workspace(),
+                            provider.object_id(),
+                            &removed_handles,
+                        )
+                        .await?;
+                }
+                return Ok(());
+            }
+            Err(PersistenceError::Conflict { .. }) if attempt < MAX_ROLLBACK_ATTEMPTS => {}
+            Err(error) => {
+                return Err(Status::internal(format!(
+                    "rollback superseded provider credential failed: {error}"
+                )));
+            }
+        }
+    }
+
+    Err(Status::aborted(
+        "provider changed while rolling back superseded credential publication",
+    ))
 }
 
 async fn cleanup_staged_refresh_handles(
@@ -801,6 +1044,7 @@ async fn mint_credential(
             mint_aws_sts_assume_role(state).await
         }
         ProviderCredentialRefreshStrategy::OpenaiCodexOauth => mint_openai_codex_oauth(state).await,
+        ProviderCredentialRefreshStrategy::XaiGrokOauth => mint_xai_grok_oauth(state).await,
         ProviderCredentialRefreshStrategy::External
         | ProviderCredentialRefreshStrategy::Static
         | ProviderCredentialRefreshStrategy::Unspecified => Err(Status::failed_precondition(
@@ -856,6 +1100,14 @@ struct OpenAiCodexRefreshResponse {
     access_token: Option<String>,
     refresh_token: Option<String>,
     id_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct XaiGrokRefreshResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_in: Option<i64>,
+    token_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -938,26 +1190,80 @@ fn codex_account_claims(id_token: &str) -> Result<(String, bool), Status> {
     Ok((account_id, auth.chatgpt_account_is_fedramp))
 }
 
-fn codex_auth_endpoint(state: &StoredProviderCredentialRefreshState, revoke: bool) -> String {
+/// Provider-specific refresh/revoke and identity behavior behind the shared,
+/// bounded, redirect-denying subscription lifecycle.
+trait SubscriptionOauthAdapter: Sync {
+    fn spec(&self) -> &'static subscription_oauth::SubscriptionOauthSpec;
+
+    fn build_refresh_request(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        state: &StoredProviderCredentialRefreshState,
+    ) -> Result<reqwest::RequestBuilder, Status>;
+
+    /// Parse the access token, expiry, rotated refresh token, and any
+    /// provider-bound identity metadata.
+    fn parse_refresh_response(
+        &self,
+        state: &StoredProviderCredentialRefreshState,
+        body: &[u8],
+    ) -> Result<MintedCredential, Status>;
+
+    fn build_revoke_request(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        state: &StoredProviderCredentialRefreshState,
+    ) -> Result<reqwest::RequestBuilder, Status>;
+
+    fn terminal_refresh_codes(&self) -> &'static [&'static str];
+}
+
+struct OpenAiCodexOauthAdapter;
+struct XaiGrokOauthAdapter;
+
+static OPENAI_CODEX_ADAPTER: OpenAiCodexOauthAdapter = OpenAiCodexOauthAdapter;
+static XAI_GROK_ADAPTER: XaiGrokOauthAdapter = XaiGrokOauthAdapter;
+
+fn subscription_oauth_adapter(
+    strategy: ProviderCredentialRefreshStrategy,
+) -> Option<&'static dyn SubscriptionOauthAdapter> {
+    match strategy {
+        ProviderCredentialRefreshStrategy::OpenaiCodexOauth => Some(&OPENAI_CODEX_ADAPTER),
+        ProviderCredentialRefreshStrategy::XaiGrokOauth => Some(&XAI_GROK_ADAPTER),
+        _ => None,
+    }
+}
+
+fn subscription_auth_endpoint(
+    adapter: &dyn SubscriptionOauthAdapter,
+    state: &StoredProviderCredentialRefreshState,
+    revoke: bool,
+) -> String {
     #[cfg(test)]
     if let Some(base) = state.material.get("test_auth_base_url") {
+        let prefix = match adapter.spec().provider {
+            subscription_oauth::SubscriptionOauthProvider::OpenAiCodex => "oauth",
+            subscription_oauth::SubscriptionOauthProvider::XaiGrok => "oauth2",
+        };
         return format!(
-            "{}/oauth/{}",
+            "{}/{prefix}/{}",
             base.trim_end_matches('/'),
             if revoke { "revoke" } else { "token" }
         );
     }
     #[cfg(not(test))]
-    let _ = state;
+    let _ = (adapter, state);
     if revoke {
-        OPENAI_CODEX_OAUTH_REVOKE_URL.to_string()
+        adapter.spec().revocation_url.to_string()
     } else {
-        OPENAI_CODEX_OAUTH_TOKEN_URL.to_string()
+        adapter.spec().token_url.to_string()
     }
 }
 
-fn codex_refresh_failure(status: reqwest::StatusCode, body: &[u8]) -> Status {
-    let code = serde_json::from_slice::<serde_json::Value>(body)
+fn oauth_error_code(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {
             value
@@ -971,161 +1277,413 @@ fn codex_refresh_failure(status: reqwest::StatusCode, body: &[u8]) -> Status {
                 })
                 .or_else(|| value.get("code").and_then(serde_json::Value::as_str))
                 .map(str::to_ascii_lowercase)
-        });
-    let known_terminal = matches!(
-        code.as_deref(),
-        Some("refresh_token_expired" | "refresh_token_reused" | "refresh_token_invalidated")
-    );
+        })
+}
+
+fn subscription_refresh_failure(
+    adapter: &dyn SubscriptionOauthAdapter,
+    status: reqwest::StatusCode,
+    body: &[u8],
+) -> Status {
+    let code = oauth_error_code(body);
+    let known_terminal = code
+        .as_deref()
+        .is_some_and(|code| adapter.terminal_refresh_codes().contains(&code));
+    let name = adapter.spec().display_name;
     if known_terminal
         || status == reqwest::StatusCode::BAD_REQUEST
         || status == reqwest::StatusCode::UNAUTHORIZED
         || status == reqwest::StatusCode::FORBIDDEN
     {
-        return Status::failed_precondition(
-            "OpenAI Codex subscription authorization requires sign-in",
-        );
+        return Status::failed_precondition(format!(
+            "{name} subscription authorization requires sign-in"
+        ));
     }
     if status == reqwest::StatusCode::REQUEST_TIMEOUT {
-        return Status::deadline_exceeded("OpenAI Codex token refresh timed out");
+        return Status::deadline_exceeded(format!("{name} token refresh timed out"));
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Status::resource_exhausted("OpenAI Codex token refresh was rate limited");
+        return Status::resource_exhausted(format!("{name} token refresh was rate limited"));
     }
     Status::unavailable(format!(
-        "OpenAI Codex token refresh temporarily failed (HTTP {})",
+        "{name} token refresh temporarily failed (HTTP {})",
         status.as_u16()
     ))
 }
 
-async fn bounded_codex_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, Status> {
+async fn bounded_subscription_response_body(
+    mut response: reqwest::Response,
+    provider_name: &str,
+    operation: &str,
+) -> Result<Vec<u8>, Status> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_OPENAI_CODEX_OAUTH_RESPONSE_BYTES as u64)
+        .is_some_and(|length| length > subscription_oauth::MAX_RESPONSE_BYTES as u64)
     {
-        return Err(Status::unavailable(
-            "OpenAI Codex token response exceeded the size limit",
-        ));
+        return Err(Status::unavailable(format!(
+            "{provider_name} {operation} response exceeded the size limit"
+        )));
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| Status::unavailable("OpenAI Codex token refresh response failed"))?
+        .map_err(|_| Status::unavailable(format!("{provider_name} {operation} response failed")))?
     {
-        if bytes.len().saturating_add(chunk.len()) > MAX_OPENAI_CODEX_OAUTH_RESPONSE_BYTES {
-            return Err(Status::unavailable(
-                "OpenAI Codex token response exceeded the size limit",
-            ));
+        if bytes.len().saturating_add(chunk.len()) > subscription_oauth::MAX_RESPONSE_BYTES {
+            return Err(Status::unavailable(format!(
+                "{provider_name} {operation} response exceeded the size limit"
+            )));
         }
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
 }
 
+fn bounded_expires_at_ms(expires_in: i64, max_lifetime_seconds: i64) -> Result<i64, Status> {
+    if expires_in <= 0 {
+        return Err(Status::failed_precondition(
+            "subscription OAuth token endpoint returned invalid expiry",
+        ));
+    }
+    let lifetime_cap_seconds = if max_lifetime_seconds > 0 {
+        max_lifetime_seconds
+    } else {
+        DEFAULT_MAX_LIFETIME_SECONDS
+    };
+    Ok(current_time_ms().saturating_add(expires_in.min(lifetime_cap_seconds).saturating_mul(1000)))
+}
+
+impl SubscriptionOauthAdapter for OpenAiCodexOauthAdapter {
+    fn spec(&self) -> &'static subscription_oauth::SubscriptionOauthSpec {
+        &subscription_oauth::OPENAI_CODEX_SPEC
+    }
+
+    fn build_refresh_request(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        state: &StoredProviderCredentialRefreshState,
+    ) -> Result<reqwest::RequestBuilder, Status> {
+        let refresh_token = required_material(&state.material, "refresh_token")?;
+        Ok(client
+            .post(endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&serde_json::json!({
+                "client_id": self.spec().client_id,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            }))
+            .header("originator", "openshell"))
+    }
+
+    fn parse_refresh_response(
+        &self,
+        state: &StoredProviderCredentialRefreshState,
+        body: &[u8],
+    ) -> Result<MintedCredential, Status> {
+        let expected_account_id = required_material(&state.material, "account_id")?;
+        let token: OpenAiCodexRefreshResponse = serde_json::from_slice(body).map_err(|_| {
+            Status::failed_precondition("OpenAI Codex token endpoint returned invalid JSON")
+        })?;
+        let access_token = token
+            .access_token
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Status::failed_precondition("OpenAI Codex token endpoint returned no access token")
+            })?;
+        let expires_at_ms = jwt_expiry_ms(&access_token, state.max_lifetime_seconds)?;
+        let mut material_updates = HashMap::new();
+        if let Some(id_token) = token.id_token.filter(|value| !value.trim().is_empty()) {
+            let (account_id, is_fedramp) = codex_account_claims(&id_token)?;
+            if account_id != expected_account_id {
+                return Err(Status::failed_precondition(
+                    "OpenAI Codex refreshed a different account; sign in again",
+                ));
+            }
+            material_updates.insert("account_id".to_string(), account_id);
+            material_updates.insert("fedramp".to_string(), is_fedramp.to_string());
+        }
+        Ok(MintedCredential {
+            access_token,
+            expires_at_ms,
+            refresh_token: token.refresh_token.filter(|value| !value.trim().is_empty()),
+            additional_credentials: HashMap::new(),
+            material_updates,
+        })
+    }
+
+    fn build_revoke_request(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        state: &StoredProviderCredentialRefreshState,
+    ) -> Result<reqwest::RequestBuilder, Status> {
+        let refresh_token = required_material(&state.material, "refresh_token")?;
+        Ok(client
+            .post(endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&serde_json::json!({
+                "client_id": self.spec().client_id,
+                "token": refresh_token,
+                "token_type_hint": "refresh_token",
+            }))
+            .header("originator", "openshell"))
+    }
+
+    fn terminal_refresh_codes(&self) -> &'static [&'static str] {
+        &[
+            "refresh_token_expired",
+            "refresh_token_reused",
+            "refresh_token_invalidated",
+            "invalid_grant",
+        ]
+    }
+}
+
+impl SubscriptionOauthAdapter for XaiGrokOauthAdapter {
+    fn spec(&self) -> &'static subscription_oauth::SubscriptionOauthSpec {
+        &subscription_oauth::XAI_GROK_SPEC
+    }
+
+    fn build_refresh_request(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        state: &StoredProviderCredentialRefreshState,
+    ) -> Result<reqwest::RequestBuilder, Status> {
+        let refresh_token = required_material(&state.material, "refresh_token")?;
+        let form = vec![
+            ("grant_type".to_string(), "refresh_token".to_string()),
+            ("client_id".to_string(), self.spec().client_id.to_string()),
+            ("refresh_token".to_string(), refresh_token),
+        ];
+        Ok(client.post(endpoint).form(&form))
+    }
+
+    fn parse_refresh_response(
+        &self,
+        state: &StoredProviderCredentialRefreshState,
+        body: &[u8],
+    ) -> Result<MintedCredential, Status> {
+        let token: XaiGrokRefreshResponse = serde_json::from_slice(body).map_err(|_| {
+            Status::failed_precondition("xAI Grok token endpoint returned invalid JSON")
+        })?;
+        if token
+            .token_type
+            .as_deref()
+            .is_some_and(|token_type| !token_type.eq_ignore_ascii_case("bearer"))
+        {
+            return Err(Status::failed_precondition(
+                "xAI Grok token endpoint returned unsupported token type",
+            ));
+        }
+        let access_token = token
+            .access_token
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Status::failed_precondition("xAI Grok token endpoint returned no access token")
+            })?;
+        let expires_at_ms = bounded_expires_at_ms(
+            token.expires_in.ok_or_else(|| {
+                Status::failed_precondition("xAI Grok token endpoint returned no expiry")
+            })?,
+            state.max_lifetime_seconds,
+        )?;
+        Ok(MintedCredential {
+            access_token,
+            expires_at_ms,
+            refresh_token: token.refresh_token.filter(|value| !value.trim().is_empty()),
+            additional_credentials: HashMap::new(),
+            material_updates: HashMap::new(),
+        })
+    }
+
+    fn build_revoke_request(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        state: &StoredProviderCredentialRefreshState,
+    ) -> Result<reqwest::RequestBuilder, Status> {
+        let refresh_token = required_material(&state.material, "refresh_token")?;
+        let form = vec![
+            ("client_id".to_string(), self.spec().client_id.to_string()),
+            ("token".to_string(), refresh_token),
+            ("token_type_hint".to_string(), "refresh_token".to_string()),
+        ];
+        Ok(client.post(endpoint).form(&form))
+    }
+
+    fn terminal_refresh_codes(&self) -> &'static [&'static str] {
+        &[
+            "invalid_grant",
+            "invalid_client",
+            "unauthorized_client",
+            "access_denied",
+            "expired_token",
+        ]
+    }
+}
+
+async fn mint_subscription_oauth(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<MintedCredential, Status> {
+    let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
+        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
+    let adapter = subscription_oauth_adapter(strategy).ok_or_else(|| {
+        Status::invalid_argument("refresh state is not a managed subscription OAuth strategy")
+    })?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(
+            subscription_oauth::HTTP_TIMEOUT_SECONDS,
+        ))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| Status::internal("build subscription OAuth client failed"))?;
+    let endpoint = subscription_auth_endpoint(adapter, state, false);
+    let response = adapter
+        .build_refresh_request(&client, &endpoint, state)?
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_connect() {
+                Status::unavailable(format!(
+                    "{} token refresh connection failed",
+                    adapter.spec().display_name
+                ))
+            } else {
+                Status::failed_precondition(format!(
+                    "{} token refresh outcome is unknown; provider login is required",
+                    adapter.spec().display_name
+                ))
+            }
+        })?;
+    let status = response.status();
+    let body = match bounded_subscription_response_body(
+        response,
+        adapter.spec().display_name,
+        "token refresh",
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(_) if status.is_success() => {
+            return Err(Status::failed_precondition(format!(
+                "{} token refresh outcome is unknown; provider login is required",
+                adapter.spec().display_name
+            )));
+        }
+        Err(_) => return Err(subscription_refresh_failure(adapter, status, &[])),
+    };
+    if !status.is_success() {
+        return Err(subscription_refresh_failure(adapter, status, &body));
+    }
+    adapter.parse_refresh_response(state, &body)
+}
+
 async fn mint_openai_codex_oauth(
     state: &StoredProviderCredentialRefreshState,
 ) -> Result<MintedCredential, Status> {
-    let refresh_token = required_material(&state.material, "refresh_token")?;
-    let expected_account_id = required_material(&state.material, "account_id")?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| Status::internal("build OpenAI Codex OAuth client failed"))?;
-    let response = client
-        .post(codex_auth_endpoint(state, false))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({
-            "client_id": OPENAI_CODEX_OAUTH_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-        }))
-        .header("originator", "openshell")
-        .send()
-        .await
-        .map_err(|_| Status::unavailable("OpenAI Codex token refresh request failed"))?;
-    let status = response.status();
-    let body = bounded_codex_response_body(response).await?;
-    if !status.is_success() {
-        return Err(codex_refresh_failure(status, &body));
-    }
-    let token: OpenAiCodexRefreshResponse = serde_json::from_slice(&body).map_err(|_| {
-        Status::failed_precondition("OpenAI Codex token endpoint returned invalid JSON")
-    })?;
-    let access_token = token
-        .access_token
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Status::failed_precondition("OpenAI Codex token endpoint returned no access token")
-        })?;
-    let expires_at_ms = jwt_expiry_ms(&access_token, state.max_lifetime_seconds)?;
-    let mut material_updates = HashMap::new();
-    if let Some(id_token) = token.id_token.filter(|value| !value.trim().is_empty()) {
-        let (account_id, is_fedramp) = codex_account_claims(&id_token)?;
-        if account_id != expected_account_id {
-            return Err(Status::failed_precondition(
-                "OpenAI Codex refreshed a different account; sign in again",
-            ));
-        }
-        material_updates.insert("account_id".to_string(), account_id);
-        material_updates.insert("fedramp".to_string(), is_fedramp.to_string());
-    }
-    Ok(MintedCredential {
-        access_token,
-        expires_at_ms,
-        refresh_token: token.refresh_token.filter(|value| !value.trim().is_empty()),
-        additional_credentials: HashMap::new(),
-        material_updates,
-    })
-}
-
-pub async fn revoke_openai_codex_oauth(
-    state: &StoredProviderCredentialRefreshState,
-) -> Result<(), Status> {
     if ProviderCredentialRefreshStrategy::try_from(state.strategy)
         != Ok(ProviderCredentialRefreshStrategy::OpenaiCodexOauth)
     {
         return Err(Status::invalid_argument(
-            "remote revocation is supported only for openai_codex_oauth",
+            "refresh state is not openai_codex_oauth",
         ));
     }
-    let refresh_token = required_material(&state.material, "refresh_token")?;
+    mint_subscription_oauth(state).await
+}
+
+async fn mint_xai_grok_oauth(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<MintedCredential, Status> {
+    if ProviderCredentialRefreshStrategy::try_from(state.strategy)
+        != Ok(ProviderCredentialRefreshStrategy::XaiGrokOauth)
+    {
+        return Err(Status::invalid_argument(
+            "refresh state is not xai_grok_oauth",
+        ));
+    }
+    mint_subscription_oauth(state).await
+}
+
+fn revoke_is_idempotent_success(body: &[u8]) -> bool {
+    matches!(
+        oauth_error_code(body).as_deref(),
+        Some(
+            "invalid_token"
+                | "invalid_grant"
+                | "refresh_token_expired"
+                | "refresh_token_reused"
+                | "refresh_token_invalidated"
+        )
+    )
+}
+
+pub async fn revoke_subscription_oauth(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<(), Status> {
+    let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
+        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
+    let adapter = subscription_oauth_adapter(strategy).ok_or_else(|| {
+        Status::invalid_argument(
+            "remote revocation is supported only for managed subscription OAuth strategies",
+        )
+    })?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(
+            subscription_oauth::HTTP_TIMEOUT_SECONDS,
+        ))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|_| Status::internal("build OpenAI Codex revoke client failed"))?;
-    let response = client
-        .post(codex_auth_endpoint(state, true))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({
-            "client_id": OPENAI_CODEX_OAUTH_CLIENT_ID,
-            "token": refresh_token,
-            "token_type_hint": "refresh_token",
-        }))
-        .header("originator", "openshell")
+        .map_err(|_| Status::internal("build subscription OAuth revoke client failed"))?;
+    let endpoint = subscription_auth_endpoint(adapter, state, true);
+    let response = adapter
+        .build_revoke_request(&client, &endpoint, state)?
         .send()
         .await
-        .map_err(|_| Status::unavailable("OpenAI Codex revoke request failed"))?;
+        .map_err(|_| {
+            Status::unavailable(format!(
+                "{} revoke request failed",
+                adapter.spec().display_name
+            ))
+        })?;
     let status = response.status();
+    let body =
+        bounded_subscription_response_body(response, adapter.spec().display_name, "revoke").await?;
     if status.is_success() {
+        return Ok(());
+    }
+    // RFC 7009 revocation is idempotent. Some authorities nevertheless report
+    // an already-dead grant with an error code; treat only reviewed invalid-grant
+    // codes as terminal success so a repeated logout can converge.
+    if matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+    ) && revoke_is_idempotent_success(&body)
+    {
         return Ok(());
     }
     if status == reqwest::StatusCode::BAD_REQUEST
         || status == reqwest::StatusCode::UNAUTHORIZED
         || status == reqwest::StatusCode::FORBIDDEN
     {
-        return Err(Status::failed_precondition(
-            "OpenAI Codex revoke request was rejected",
-        ));
+        return Err(Status::failed_precondition(format!(
+            "{} revoke request was rejected",
+            adapter.spec().display_name
+        )));
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Err(Status::resource_exhausted(
-            "OpenAI Codex revoke request was rate limited",
-        ));
+        return Err(Status::resource_exhausted(format!(
+            "{} revoke request was rate limited",
+            adapter.spec().display_name
+        )));
     }
     Err(Status::unavailable(format!(
-        "OpenAI Codex revoke temporarily failed (HTTP {})",
+        "{} revoke temporarily failed (HTTP {})",
+        adapter.spec().display_name,
         status.as_u16()
     )))
 }
@@ -1482,6 +2040,17 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
     });
 }
 
+fn subscription_refresh_requires_operator_action(
+    state: &StoredProviderCredentialRefreshState,
+) -> bool {
+    ProviderCredentialRefreshStrategy::try_from(state.strategy)
+        .is_ok_and(subscription_oauth::is_managed_strategy)
+        && matches!(
+            state.status.as_str(),
+            "reauth_required" | "revoking" | "revoke_failed"
+        )
+}
+
 #[tracing::instrument(
     name = "refresh",
     skip_all,
@@ -1503,7 +2072,10 @@ async fn run_refresh_worker_tick(
     let watched_count = states.len();
     let due_count = states
         .iter()
-        .filter(|state| state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms)
+        .filter(|state| {
+            !subscription_refresh_requires_operator_action(state)
+                && (state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms)
+        })
         .count();
     let rotation_requested_count = states
         .iter()
@@ -1526,6 +2098,16 @@ async fn run_refresh_worker_tick(
     for state in states {
         let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
             .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
+        if subscription_refresh_requires_operator_action(&state) {
+            info!(
+                provider = %state.provider_name,
+                credential_key = %state.credential_key,
+                strategy = %refresh_strategy_name(state.strategy),
+                status = %state.status,
+                "subscription OAuth refresh awaits provider login or logout retry"
+            );
+            continue;
+        }
         let due = state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms;
         let rotation_requested = state.status == "rotation_requested";
         let incomplete_publish = state.status == "publishing";
@@ -1592,9 +2174,10 @@ async fn run_refresh_worker_tick(
 mod tests {
     use super::{
         NewRefreshStateConfig, delete_refresh_state, get_refresh_state, mint_openai_codex_oauth,
-        new_refresh_state, put_refresh_state,
+        mint_xai_grok_oauth, new_refresh_state, put_refresh_state,
         refresh_provider_credential_inner as refresh_provider_credential, refresh_state_name,
-        refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
+        refresh_strategy_name, revoke_subscription_oauth, run_refresh_worker_tick,
+        seconds_until_ms,
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
@@ -1709,6 +2292,38 @@ mod tests {
             },
         )
         .expect("Codex refresh state")
+    }
+
+    fn grok_refresh_state(
+        provider: &Provider,
+        auth_base_url: &str,
+    ) -> openshell_core::proto::StoredProviderCredentialRefreshState {
+        new_refresh_state(
+            provider,
+            "default",
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+            NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::XaiGrokOauth,
+                material: HashMap::from([
+                    (
+                        "refresh_token".to_string(),
+                        "old-grok-refresh-token".to_string(),
+                    ),
+                    ("test_auth_base_url".to_string(), auth_base_url.to_string()),
+                ]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms: 0,
+                token_url: openshell_core::subscription_oauth::XAI_GROK_TOKEN_URL.to_string(),
+                scopes: openshell_core::subscription_oauth::XAI_GROK_SCOPES
+                    .iter()
+                    .map(|scope| (*scope).to_string())
+                    .collect(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+            },
+        )
+        .expect("Grok refresh state")
     }
 
     #[tokio::test]
@@ -1894,8 +2509,8 @@ mod tests {
         let error = mint_openai_codex_oauth(&state)
             .await
             .expect_err("oversized token response must fail");
-        assert_eq!(error.code(), tonic::Code::Unavailable);
-        assert!(error.message().contains("size limit"));
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("outcome is unknown"));
         assert!(!error.message().contains("oversized-response-secret-canary"));
     }
 
@@ -2066,6 +2681,481 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(!error.message().contains("different-account"));
         assert!(!error.message().contains("account-123"));
+    }
+
+    #[tokio::test]
+    async fn xai_grok_refresh_uses_pinned_contract_and_persists_rotated_grant() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains(format!(
+                "client_id={}",
+                openshell_core::subscription_oauth::XAI_GROK_CLIENT_ID
+            )))
+            .and(body_string_contains("refresh_token=old-grok-refresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "grok-access-token-canary",
+                "refresh_token": "rotated-grok-refresh-token",
+                "expires_in": 7200,
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let provider = provider(
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+        );
+        store.put_message(&provider).await.unwrap();
+        let state = grok_refresh_state(&provider, &mock_server.uri());
+        put_refresh_state(&store, &state).await.unwrap();
+        let before_ms = current_time_ms();
+
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .expect("Grok credential should refresh");
+        assert_eq!(refreshed.status, "refreshed");
+        assert_eq!(
+            refreshed.material["refresh_token"],
+            "rotated-grok-refresh-token"
+        );
+        assert!(refreshed.expires_at_ms > before_ms);
+        assert!(refreshed.expires_at_ms <= before_ms + 3_601_000);
+
+        let stored = store
+            .get_message_by_name::<Provider>("default", "grok-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.credentials[openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY],
+            "grok-access-token-canary"
+        );
+        assert_eq!(
+            stored.credential_expires_at_ms
+                [openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY],
+            refreshed.expires_at_ms
+        );
+        assert!(
+            !stored
+                .credentials
+                .values()
+                .any(|value| value == "rotated-grok-refresh-token")
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        let request_body = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            !request_body
+                .split('&')
+                .any(|parameter| parameter.starts_with("scope=")),
+            "xAI refresh must preserve the original grant by omitting scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_subscription_rotation_is_provider_and_generation_isolated() {
+        let mock_server = MockServer::start().await;
+        let codex_expires = current_time_ms() / 1000 + 3600;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(body_json(serde_json::json!({
+                "client_id": super::OPENAI_CODEX_OAUTH_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": "old-refresh-token"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": test_jwt(serde_json::json!({"exp": codex_expires})),
+                "refresh_token": "rotated-codex-refresh-token",
+                "id_token": test_jwt(serde_json::json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "account-123",
+                        "chatgpt_account_is_fedramp": false
+                    }
+                }))
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .and(body_string_contains("refresh_token=old-grok-refresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "grok-access-token-canary",
+                "refresh_token": "rotated-grok-refresh-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let codex = provider("codex-subscription", "openai-codex-oauth");
+        let grok = provider(
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+        );
+        store.put_message(&codex).await.unwrap();
+        store.put_message(&grok).await.unwrap();
+        let codex_state = codex_refresh_state(&codex, &mock_server.uri(), "account-123");
+        let grok_state = grok_refresh_state(&grok, &mock_server.uri());
+        let codex_generation = codex_state.refresh_generation_id.clone();
+        let grok_generation = grok_state.refresh_generation_id.clone();
+        put_refresh_state(&store, &codex_state).await.unwrap();
+        put_refresh_state(&store, &grok_state).await.unwrap();
+
+        refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .expect("Grok should rotate independently");
+        let untouched_codex = get_refresh_state(
+            &store,
+            "default",
+            codex.object_id(),
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(untouched_codex.refresh_generation_id, codex_generation);
+        assert_eq!(
+            untouched_codex.material["refresh_token"],
+            "old-refresh-token"
+        );
+        let codex_record = store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !codex_record
+                .credentials
+                .contains_key(super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY)
+        );
+
+        refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "codex-subscription",
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .expect("Codex should rotate independently");
+        let rotated_grok = get_refresh_state(
+            &store,
+            "default",
+            grok.object_id(),
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(rotated_grok.refresh_generation_id, grok_generation);
+        assert_eq!(
+            rotated_grok.material["refresh_token"],
+            "rotated-grok-refresh-token"
+        );
+        let grok_record = store
+            .get_message_by_name::<Provider>("default", "grok-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            grok_record.credentials[openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY],
+            "grok-access-token-canary"
+        );
+        let rotated_codex = get_refresh_state(
+            &store,
+            "default",
+            codex.object_id(),
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(rotated_codex.refresh_generation_id, codex_generation);
+        assert_eq!(
+            rotated_codex.material["refresh_token"],
+            "rotated-codex-refresh-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn xai_grok_refresh_classifies_retryable_and_terminal_errors_without_leaks() {
+        for (status, error_code, expected_code) in [
+            (408, "timeout-canary", tonic::Code::DeadlineExceeded),
+            (429, "rate-canary", tonic::Code::ResourceExhausted),
+            (500, "server-canary", tonic::Code::Unavailable),
+            (400, "invalid_grant", tonic::Code::FailedPrecondition),
+        ] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth2/token"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "error": error_code,
+                        "error_description": "grok-response-secret-canary"
+                    })),
+                )
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+            let provider = provider(
+                "grok-subscription",
+                openshell_core::subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+            );
+            let state = grok_refresh_state(&provider, &mock_server.uri());
+
+            let error = mint_xai_grok_oauth(&state)
+                .await
+                .expect_err("Grok refresh should fail");
+            assert_eq!(error.code(), expected_code);
+            assert!(!error.message().contains("grok-response-secret-canary"));
+            assert!(!error.message().contains(error_code));
+        }
+    }
+
+    #[tokio::test]
+    async fn xai_grok_gateway_http_denies_redirects_and_bounds_failures() {
+        let redirect_target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/stolen"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&redirect_target)
+            .await;
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/stolen", redirect_target.uri()))
+                    .set_body_string("redirect-response-secret-canary"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let provider = provider(
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+        );
+        let state = grok_refresh_state(&provider, &mock_server.uri());
+
+        let error = mint_xai_grok_oauth(&state)
+            .await
+            .expect_err("redirect must not be followed");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(!error.message().contains("redirect-response-secret-canary"));
+        assert!(!error.message().contains(&redirect_target.uri()));
+    }
+
+    #[tokio::test]
+    async fn xai_grok_terminal_refresh_requires_reauthentication() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "terminal-response-secret-canary"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let store = test_store().await;
+        let provider = provider(
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+        );
+        store.put_message(&provider).await.unwrap();
+        let state = grok_refresh_state(&provider, &mock_server.uri());
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let error = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .expect_err("terminal grant rejection must fail");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        let stored = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.status, "reauth_required");
+        assert_eq!(stored.next_refresh_at_ms, 0);
+        assert!(
+            !stored
+                .last_error
+                .contains("terminal-response-secret-canary")
+        );
+        assert!(!stored.last_error.contains("invalid_grant"));
+
+        let retry = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .expect_err("terminal state must require a new attended login");
+        assert_eq!(retry.code(), tonic::Code::FailedPrecondition);
+        assert!(retry.message().contains("provider login"));
+    }
+
+    #[tokio::test]
+    async fn refresh_worker_does_not_retry_terminal_subscription_grants() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let store = test_store().await;
+        let provider = provider(
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+        );
+        store.put_message(&provider).await.unwrap();
+        let mut state = grok_refresh_state(&provider, &mock_server.uri());
+        state.status = "reauth_required".to_string();
+        state.next_refresh_at_ms = 0;
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let operation_mutex = tokio::sync::Mutex::new(());
+        run_refresh_worker_tick(&operation_mutex, &store, None)
+            .await
+            .unwrap();
+
+        let stored = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.status, "reauth_required");
+        assert_eq!(stored.next_refresh_at_ms, 0);
+        assert_eq!(stored.material["refresh_token"], "old-grok-refresh-token");
+    }
+
+    #[tokio::test]
+    async fn expired_rotation_lease_requires_reauthentication_without_reusing_refresh_token() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "must-not-be-minted",
+                "refresh_token": "must-not-be-rotated",
+                "expires_in": 3600
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let store = test_store().await;
+        let provider = provider(
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+        );
+        store.put_message(&provider).await.unwrap();
+        let mut state = grok_refresh_state(&provider, &mock_server.uri());
+        state.status = "rotating".to_string();
+        state.next_refresh_at_ms = current_time_ms() - 1;
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let error = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .expect_err("an ambiguous spent-token outcome must fail closed");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("outcome is unknown"));
+
+        let stored = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.status, "reauth_required");
+        assert_eq!(stored.next_refresh_at_ms, 0);
+        assert_eq!(stored.material["refresh_token"], "old-grok-refresh-token");
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn xai_grok_revoke_is_remote_bounded_and_idempotent() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/revoke"))
+            .and(body_string_contains("token=old-grok-refresh-token"))
+            .and(body_string_contains("token_type_hint=refresh_token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "already-dead-response-canary"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let provider = provider(
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+        );
+        let state = grok_refresh_state(&provider, &mock_server.uri());
+        revoke_subscription_oauth(&state)
+            .await
+            .expect("invalid_grant is an idempotent revoke success");
+
+        let retry_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/revoke"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "revoke-response-secret-canary"
+            })))
+            .expect(1)
+            .mount(&retry_server)
+            .await;
+        let retry_state = grok_refresh_state(&provider, &retry_server.uri());
+        let error = revoke_subscription_oauth(&retry_state)
+            .await
+            .expect_err("transient revoke failure must remain retryable");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(!error.message().contains("revoke-response-secret-canary"));
+        assert!(!error.message().contains("invalid_grant"));
     }
 
     #[tokio::test]
@@ -2916,6 +4006,152 @@ mod tests {
             stored.credential_expires_at_ms.get("AWS_SESSION_TOKEN"),
             Some(&4_000_000_000_000)
         );
+    }
+
+    #[tokio::test]
+    async fn subscription_publish_rollback_clears_only_its_losing_inline_mint() {
+        use super::{apply_minted_credential, rollback_applied_minted_credential};
+
+        let store = test_store().await;
+        let prov = provider("codex-subscription", "openai-codex-oauth");
+        store.put_message(&prov).await.unwrap();
+        let minted = super::MintedCredential {
+            access_token: "losing-access-token".to_string(),
+            expires_at_ms: 4_000_000_000_000,
+            refresh_token: Some("rotated-refresh-token".to_string()),
+            additional_credentials: HashMap::new(),
+            material_updates: HashMap::new(),
+        };
+
+        let receipt = apply_minted_credential(
+            &store,
+            "default",
+            None,
+            &prov,
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            &minted,
+        )
+        .await
+        .unwrap();
+        rollback_applied_minted_credential(&store, None, &prov, &receipt)
+            .await
+            .unwrap();
+
+        let cleared = store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !cleared
+                .credentials
+                .contains_key(super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY)
+        );
+        assert!(
+            !cleared
+                .credential_expires_at_ms
+                .contains_key(super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY)
+        );
+
+        // If another publication wins before cleanup, the receipt comparison
+        // must preserve that newer value and its independently owned expiry.
+        let receipt = apply_minted_credential(
+            &store,
+            "default",
+            None,
+            &cleared,
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            &minted,
+        )
+        .await
+        .unwrap();
+        let winner_expires_at_ms = minted.expires_at_ms + 1;
+        store
+            .update_message_cas::<Provider, _>(prov.object_id(), 0, |current| {
+                current.credentials.insert(
+                    super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY.to_string(),
+                    "winner-access-token".to_string(),
+                );
+                current.credential_expires_at_ms.insert(
+                    super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY.to_string(),
+                    winner_expires_at_ms,
+                );
+            })
+            .await
+            .unwrap();
+        rollback_applied_minted_credential(&store, None, &prov, &receipt)
+            .await
+            .unwrap();
+
+        let preserved = store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            preserved
+                .credentials
+                .get(super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY),
+            Some(&"winner-access-token".to_string())
+        );
+        assert_eq!(
+            preserved
+                .credential_expires_at_ms
+                .get(super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY),
+            Some(&winner_expires_at_ms)
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_publish_rollback_removes_its_losing_stored_handle() {
+        use super::{apply_minted_credential, rollback_applied_minted_credential};
+
+        let store = test_store().await;
+        let credentials = CredentialRuntime::from_config(
+            &Config::new(None).with_credential_drivers(["test-static"]),
+        )
+        .unwrap();
+        let prov = provider("grok-subscription", "xai-grok-oauth");
+        store.put_message(&prov).await.unwrap();
+        let minted = super::MintedCredential {
+            access_token: "losing-grok-access-token".to_string(),
+            expires_at_ms: 4_000_000_000_000,
+            refresh_token: Some("rotated-grok-refresh-token".to_string()),
+            additional_credentials: HashMap::new(),
+            material_updates: HashMap::new(),
+        };
+
+        let receipt = apply_minted_credential(
+            &store,
+            "default",
+            Some(&credentials),
+            &prov,
+            super::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+            &minted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(credentials.stored_credential_count(), Some(1));
+        rollback_applied_minted_credential(&store, Some(&credentials), &prov, &receipt)
+            .await
+            .unwrap();
+
+        let cleared = store
+            .get_message_by_name::<Provider>("default", "grok-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !cleared
+                .credential_handles
+                .contains_key(super::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY)
+        );
+        assert!(
+            !cleared
+                .credential_expires_at_ms
+                .contains_key(super::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY)
+        );
+        assert_eq!(credentials.stored_credential_count(), Some(0));
     }
 
     #[tokio::test]

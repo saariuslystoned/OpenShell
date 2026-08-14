@@ -36,10 +36,6 @@ pub const DEFAULT_ROUTE_REFRESH_INTERVAL_SECS: u64 = 5;
 /// Route name for the sandbox system inference route.
 const SANDBOX_SYSTEM_ROUTE_NAME: &str = "sandbox-system";
 
-/// Routes backed by a reusable gateway-owned grant must not survive loss of
-/// the gateway refresh authority. Today this is the Codex subscription route.
-const OPENAI_CODEX_OAUTH_PROVIDER_TYPE: &str = "openai-codex-oauth";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferenceRouteSource {
     File,
@@ -360,8 +356,7 @@ fn fail_closed_route_names(
         .routes
         .iter()
         .filter(|route| {
-            openshell_core::inference::normalize_inference_provider_type(&route.provider_type)
-                == Some(OPENAI_CODEX_OAUTH_PROVIDER_TYPE)
+            openshell_core::subscription_oauth::is_managed_provider_type(&route.provider_type)
         })
         .map(|route| route.name.clone())
         .collect()
@@ -502,12 +497,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_bundle_refresh_removes_only_gateway_owned_codex_routes() {
+    async fn failed_bundle_refresh_removes_only_gateway_owned_subscription_routes() {
         let bundle = openshell_core::proto::GetInferenceBundleResponse {
             routes: vec![
                 openshell_core::proto::ResolvedRoute {
                     name: "codex-user".to_string(),
                     provider_type: "codex-subscription".to_string(),
+                    ..Default::default()
+                },
+                openshell_core::proto::ResolvedRoute {
+                    name: "grok-user".to_string(),
+                    provider_type: "grok-subscription".to_string(),
                     ..Default::default()
                 },
                 openshell_core::proto::ResolvedRoute {
@@ -517,7 +517,7 @@ mod tests {
                 },
                 openshell_core::proto::ResolvedRoute {
                     name: SANDBOX_SYSTEM_ROUTE_NAME.to_string(),
-                    provider_type: OPENAI_CODEX_OAUTH_PROVIDER_TYPE.to_string(),
+                    provider_type: "openai-codex-oauth".to_string(),
                     ..Default::default()
                 },
             ],
@@ -528,6 +528,7 @@ mod tests {
             fail_closed,
             HashSet::from([
                 "codex-user".to_string(),
+                "grok-user".to_string(),
                 SANDBOX_SYSTEM_ROUTE_NAME.to_string()
             ])
         );

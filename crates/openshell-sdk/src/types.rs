@@ -106,6 +106,11 @@ pub struct SandboxSpec {
     pub environment: HashMap<String, String>,
     /// Provider names to attach.
     pub providers: Vec<String>,
+    /// Attached provider selected for `inference.local`. Pair with
+    /// `inference_model`; the gateway validates both fields together.
+    pub inference_provider: Option<String>,
+    /// Model selected from `inference_provider` for this sandbox.
+    pub inference_model: Option<String>,
     /// Request a GPU. Driver-specific device selection is configured via
     /// driver config on the raw proto surface (see [`crate::raw`]).
     pub gpu: bool,

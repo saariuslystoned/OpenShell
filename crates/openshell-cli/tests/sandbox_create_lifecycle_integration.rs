@@ -1291,6 +1291,37 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
 }
 
 #[tokio::test]
+async fn sandbox_create_sends_explicit_inference_provider_and_model_selection() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("explicit-grok-selection"),
+            inference_provider: Some("grok-subscription"),
+            inference_model: Some("grok-4.6"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should send the explicit selection");
+
+    let requests = create_requests(&server).await;
+    let spec = requests[0].spec.as_ref().expect("sandbox spec");
+    assert_eq!(spec.inference_provider, "grok-subscription");
+    assert_eq!(spec.inference_model, "grok-4.6");
+}
+
+#[tokio::test]
 async fn sandbox_create_sends_driver_config_json() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();

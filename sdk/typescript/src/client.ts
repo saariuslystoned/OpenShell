@@ -82,6 +82,10 @@ export interface SandboxSpec {
   environment?: Record<string, string>;
   providers?: string[];
   gpu?: boolean;
+  /** Attached inference provider selected for this sandbox. Pair with `inferenceModel`. */
+  inferenceProvider?: string;
+  /** Model selected from `inferenceProvider`. Pair with `inferenceProvider`. */
+  inferenceModel?: string;
   /**
    * Create-time sandbox policy (the safety boundary). Sandbox-scoped
    * `setPolicy` cannot introduce static fields later, so express filesystem,
@@ -560,6 +564,8 @@ export class SandboxClient {
         providers: spec.providers ?? [],
         template: spec.image ? { image: spec.image } : undefined,
         resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
+        inferenceProvider: spec.inferenceProvider ?? '',
+        inferenceModel: spec.inferenceModel ?? '',
         policy: spec.policy,
       };
       if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);

@@ -81,11 +81,14 @@ impl Inference for InferenceService {
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found(format!("sandbox '{sandbox_id}' not found")))?;
         let workspace = sandbox.object_workspace();
-        resolve_inference_bundle_with_credentials(
+        let spec = sandbox.spec.as_ref();
+        let selection = sandbox_inference_selection(spec)?;
+        resolve_inference_bundle_with_selection(
             self.state.store.as_ref(),
             workspace,
             Some(&self.state.credentials),
-            sandbox.spec.as_ref().map(|spec| spec.providers.as_slice()),
+            spec.map(|spec| spec.providers.as_slice()),
+            selection,
         )
         .await
         .map(Response::new)
@@ -222,6 +225,30 @@ impl Inference for InferenceService {
     }
 }
 
+fn sandbox_inference_selection(
+    spec: Option<&openshell_core::proto::SandboxSpec>,
+) -> Result<Option<(&str, &str)>, Status> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let provider = spec.inference_provider.trim();
+    let model = spec.inference_model.trim();
+    match (provider.is_empty(), model.is_empty()) {
+        (true, true) => Ok(None),
+        (false, false) => {
+            if !spec.providers.iter().any(|attached| attached == provider) {
+                return Err(Status::failed_precondition(format!(
+                    "selected inference provider '{provider}' is not attached to the sandbox"
+                )));
+            }
+            Ok(Some((provider, model)))
+        }
+        _ => Err(Status::failed_precondition(
+            "sandbox inference provider and model selection must be configured together",
+        )),
+    }
+}
+
 #[cfg(test)]
 async fn upsert_cluster_inference_route(
     store: &Store,
@@ -297,11 +324,11 @@ async fn upsert_cluster_inference_route_with_credentials(
     let provider = resolve_provider_credentials(provider, credentials).await?;
 
     let mut resolved = resolve_provider_route(&provider, model_id)?;
-    if resolved.provider_type == "openai-codex-oauth" {
-        let context = openai_codex_route_context(store, workspace, &provider, true)
+    if openshell_core::subscription_oauth::is_managed_provider_type(&resolved.provider_type) {
+        let context = subscription_oauth_route_context(store, workspace, &provider, true)
             .await?
-            .expect("required Codex route context returns Some");
-        apply_openai_codex_route_context(&mut resolved, context);
+            .expect("required subscription route context returns Some");
+        apply_subscription_oauth_route_context(&mut resolved, context);
     }
     let validation = if verify {
         vec![verify_provider_endpoint(provider.object_name(), model_id, &resolved).await?]
@@ -393,19 +420,21 @@ struct ResolvedProviderRoute {
     credential_expires_at_ms: i64,
 }
 
-struct OpenAiCodexRouteContext {
-    account_id: String,
-    fedramp: bool,
+struct SubscriptionOauthRouteContext {
     expires_at_ms: i64,
+    account_id: Option<String>,
+    fedramp: bool,
 }
 
-async fn openai_codex_route_context(
+async fn subscription_oauth_route_context(
     store: &Store,
     workspace: &str,
     provider: &Provider,
     required: bool,
-) -> Result<Option<OpenAiCodexRouteContext>, Status> {
-    let unavailable = |message: &'static str| {
+) -> Result<Option<SubscriptionOauthRouteContext>, Status> {
+    let spec = openshell_core::subscription_oauth::spec_for_provider_type(&provider.r#type)
+        .ok_or_else(|| Status::invalid_argument("provider is not a subscription OAuth type"))?;
+    let unavailable = |message: String| {
         if required {
             Err(Status::failed_precondition(message))
         } else {
@@ -416,64 +445,102 @@ async fn openai_codex_route_context(
         store,
         workspace,
         provider.object_id(),
-        crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        spec.access_token_key,
     )
     .await?
     else {
-        return unavailable("OpenAI Codex subscription provider is not signed in");
+        return unavailable(format!(
+            "{} subscription provider is not signed in",
+            spec.display_name
+        ));
     };
     if openshell_core::proto::ProviderCredentialRefreshStrategy::try_from(refresh.strategy)
-        != Ok(openshell_core::proto::ProviderCredentialRefreshStrategy::OpenaiCodexOauth)
+        != Ok(spec.strategy)
     {
-        return unavailable("OpenAI Codex subscription provider has an invalid refresh strategy");
+        return unavailable(format!(
+            "{} subscription provider has an invalid refresh strategy",
+            spec.display_name
+        ));
     }
     if refresh.status != "refreshed" {
-        return unavailable("OpenAI Codex subscription provider is not active");
+        return unavailable(format!(
+            "{} subscription provider is not active",
+            spec.display_name
+        ));
     }
     if refresh.expires_at_ms <= current_time_ms() {
-        return unavailable("OpenAI Codex subscription access token is expired");
+        return unavailable(format!(
+            "{} subscription access token is expired",
+            spec.display_name
+        ));
     }
-    let Some(account_id) = refresh
-        .material
-        .get("account_id")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return unavailable("OpenAI Codex subscription provider is missing account routing");
-    };
-    if account_id.len() > 512 || account_id.parse::<reqwest::header::HeaderValue>().is_err() {
-        return unavailable("OpenAI Codex subscription account routing is invalid");
-    }
-    let fedramp = match refresh.material.get("fedramp").map(String::as_str) {
-        None | Some("" | "false") => false,
-        Some("true") => true,
-        Some(_) => {
-            return unavailable("OpenAI Codex subscription FedRAMP routing is invalid");
+    let (account_id, fedramp) = match spec.provider {
+        openshell_core::subscription_oauth::SubscriptionOauthProvider::OpenAiCodex => {
+            let Some(account_id) = refresh
+                .material
+                .get("account_id")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return unavailable(
+                    "OpenAI Codex subscription provider is missing account routing".to_string(),
+                );
+            };
+            if account_id.len() > 512 || account_id.parse::<reqwest::header::HeaderValue>().is_err()
+            {
+                return unavailable(
+                    "OpenAI Codex subscription account routing is invalid".to_string(),
+                );
+            }
+            let fedramp = match refresh.material.get("fedramp").map(String::as_str) {
+                None | Some("" | "false") => false,
+                Some("true") => true,
+                Some(_) => {
+                    return unavailable(
+                        "OpenAI Codex subscription FedRAMP routing is invalid".to_string(),
+                    );
+                }
+            };
+            (Some(account_id.to_string()), fedramp)
         }
+        openshell_core::subscription_oauth::SubscriptionOauthProvider::XaiGrok => (None, false),
     };
-    Ok(Some(OpenAiCodexRouteContext {
-        account_id: account_id.to_string(),
-        fedramp,
+    Ok(Some(SubscriptionOauthRouteContext {
         expires_at_ms: refresh.expires_at_ms,
+        account_id,
+        fedramp,
     }))
 }
 
-fn apply_openai_codex_route_context(
+fn apply_subscription_oauth_route_context(
     resolved: &mut ResolvedProviderRoute,
-    context: OpenAiCodexRouteContext,
+    context: SubscriptionOauthRouteContext,
 ) {
-    resolved
-        .route
-        .default_headers
-        .push(("chatgpt-account-id".to_string(), context.account_id));
+    if let Some(account_id) = context.account_id {
+        resolved
+            .route
+            .default_headers
+            .push(("chatgpt-account-id".to_string(), account_id));
+    }
     if context.fedramp {
         resolved
             .route
             .default_headers
             .push(("x-openai-fedramp".to_string(), "true".to_string()));
     }
-    resolved.credential_expires_at_ms = context.expires_at_ms;
+    // The refresh state and credential driver are independent lifetime
+    // authorities. Preserve the earliest non-zero expiry so a driver-shortened
+    // bearer can never be routed until the later refresh-state deadline.
+    resolved.credential_expires_at_ms =
+        match (resolved.credential_expires_at_ms, context.expires_at_ms) {
+            (provider_expiry, refresh_expiry) if provider_expiry > 0 && refresh_expiry > 0 => {
+                provider_expiry.min(refresh_expiry)
+            }
+            (provider_expiry, _) if provider_expiry > 0 => provider_expiry,
+            (_, refresh_expiry) => refresh_expiry,
+        };
+    resolved.route.credential_expires_at_ms = resolved.credential_expires_at_ms;
 }
 
 #[derive(Debug)]
@@ -885,7 +952,7 @@ fn resolve_provider_route(
     let profile = openshell_core::inference::profile_for(&provider_type).ok_or_else(|| {
         Status::invalid_argument(format!(
             "provider '{name}' has unsupported type '{raw_provider_type}' for cluster inference \
-                 (supported: openai, openai-codex-oauth, anthropic, nvidia, deepinfra, google-vertex-ai, aws-bedrock)",
+                 (supported: openai, openai-codex-oauth, xai-grok-oauth, anthropic, nvidia, deepinfra, google-vertex-ai, aws-bedrock)",
             name = provider.object_name()
         ))
     })?;
@@ -893,10 +960,9 @@ fn resolve_provider_route(
     // Profiles with `auth: None` are bridge-fronted — the upstream
     // authenticates itself, so the router doesn't need a credential at
     // route-resolution time. Today this is `aws-bedrock`.
-    let credential_lookup = if matches!(
-        provider_type.as_str(),
-        "google-vertex-ai" | "openai-codex-oauth"
-    ) {
+    let credential_lookup = if provider_type == "google-vertex-ai"
+        || openshell_core::subscription_oauth::is_managed_provider_type(&provider_type)
+    {
         CredentialLookup::PreferredOnly
     } else {
         CredentialLookup::PreferredThenAny
@@ -954,11 +1020,10 @@ fn resolve_provider_route(
         )));
     }
 
-    let request_path_override = if provider_type == "openai-codex-oauth" {
-        Some("/responses".to_string())
-    } else {
-        None
-    };
+    let request_path_override =
+        openshell_core::subscription_oauth::spec_for_provider_type(&provider_type)
+            .and_then(|spec| spec.request_path_override)
+            .map(str::to_string);
     Ok(ResolvedProviderRoute {
         provider_type,
         route: RouterResolvedRoute {
@@ -1140,14 +1205,57 @@ async fn resolve_inference_bundle(
     resolve_inference_bundle_with_credentials(store, workspace, None, None).await
 }
 
+#[cfg(test)]
 async fn resolve_inference_bundle_with_credentials(
     store: &Store,
     workspace: &str,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     attached_provider_names: Option<&[String]>,
 ) -> Result<GetInferenceBundleResponse, Status> {
+    resolve_inference_bundle_with_selection(
+        store,
+        workspace,
+        credentials,
+        attached_provider_names,
+        None,
+    )
+    .await
+}
+
+async fn resolve_inference_bundle_with_selection(
+    store: &Store,
+    workspace: &str,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    attached_provider_names: Option<&[String]>,
+    selection: Option<(&str, &str)>,
+) -> Result<GetInferenceBundleResponse, Status> {
     let mut routes = Vec::new();
-    if let Some(r) = resolve_route_by_name_with_credentials(
+    if let Some((provider_name, model_id)) = selection {
+        if !attached_provider_names
+            .is_some_and(|names| names.iter().any(|name| name == provider_name))
+        {
+            return Err(Status::failed_precondition(format!(
+                "selected inference provider '{provider_name}' is not attached to the sandbox"
+            )));
+        }
+        let config = InferenceRouteConfig {
+            provider_name: provider_name.to_string(),
+            model_id: model_id.to_string(),
+            timeout_secs: 0,
+        };
+        if let Some(route) = resolve_provider_model_with_credentials(
+            store,
+            workspace,
+            credentials,
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            &config,
+            attached_provider_names,
+        )
+        .await?
+        {
+            routes.push(route);
+        }
+    } else if let Some(route) = resolve_route_by_name_with_credentials(
         store,
         workspace,
         credentials,
@@ -1156,7 +1264,7 @@ async fn resolve_inference_bundle_with_credentials(
     )
     .await?
     {
-        routes.push(r);
+        routes.push(route);
     }
     if let Some(r) = resolve_route_by_name_with_credentials(
         store,
@@ -1248,6 +1356,31 @@ async fn resolve_route_by_name_with_credentials(
         )));
     }
 
+    resolve_provider_model_with_credentials(
+        store,
+        workspace,
+        credentials,
+        route_name,
+        config,
+        attached_provider_names,
+    )
+    .await
+}
+
+async fn resolve_provider_model_with_credentials(
+    store: &Store,
+    workspace: &str,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    route_name: &str,
+    config: &InferenceRouteConfig,
+    attached_provider_names: Option<&[String]>,
+) -> Result<Option<ResolvedRoute>, Status> {
+    if config.provider_name.trim().is_empty() || config.model_id.trim().is_empty() {
+        return Err(Status::failed_precondition(
+            "explicit inference selection requires provider and model",
+        ));
+    }
+
     let provider = store
         .get_message_by_name::<Provider>(workspace, &config.provider_name)
         .await
@@ -1267,20 +1400,22 @@ async fn resolve_route_by_name_with_credentials(
     {
         return Ok(None);
     }
-    let codex_context = if provider_type == "openai-codex-oauth" {
-        let Some(context) = openai_codex_route_context(store, workspace, &provider, false).await?
-        else {
-            return Ok(None);
+    let subscription_context =
+        if openshell_core::subscription_oauth::is_managed_provider_type(provider_type) {
+            let Some(context) =
+                subscription_oauth_route_context(store, workspace, &provider, false).await?
+            else {
+                return Ok(None);
+            };
+            Some(context)
+        } else {
+            None
         };
-        Some(context)
-    } else {
-        None
-    };
     let provider = resolve_provider_credentials(provider, credentials).await?;
 
     let mut resolved = resolve_provider_route(&provider, &config.model_id)?;
-    if let Some(context) = codex_context {
-        apply_openai_codex_route_context(&mut resolved, context);
+    if let Some(context) = subscription_context {
+        apply_subscription_oauth_route_context(&mut resolved, context);
     }
     if resolved.credential_expires_at_ms > 0
         && resolved.credential_expires_at_ms <= current_time_ms()
@@ -1468,6 +1603,42 @@ mod tests {
             .expect("persist Codex refresh state");
     }
 
+    async fn put_grok_refresh_state(
+        store: &Store,
+        provider: &Provider,
+        status: &str,
+        expires_at_ms: i64,
+    ) {
+        let mut refresh = crate::provider_refresh::new_refresh_state(
+            provider,
+            "default",
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: openshell_core::proto::ProviderCredentialRefreshStrategy::XaiGrokOauth,
+                material: HashMap::from([(
+                    "refresh_token".to_string(),
+                    "grok-refresh-token-canary".to_string(),
+                )]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms,
+                token_url: openshell_core::subscription_oauth::XAI_GROK_TOKEN_URL.to_string(),
+                scopes: openshell_core::subscription_oauth::XAI_GROK_SCOPES
+                    .iter()
+                    .map(|scope| (*scope).to_string())
+                    .collect(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+            },
+        )
+        .expect("Grok refresh state");
+        refresh.status = status.to_string();
+        refresh.expires_at_ms = expires_at_ms;
+        crate::provider_refresh::put_refresh_state(store, &refresh)
+            .await
+            .expect("persist Grok refresh state");
+    }
+
     fn make_provider_with_base_url(
         name: &str,
         provider_type: &str,
@@ -1560,6 +1731,7 @@ mod tests {
     async fn codex_subscription_bundle_requires_exact_attachment_and_live_grant() {
         let store = test_store().await;
         let expires_at_ms = current_time_ms() + 60_000;
+        let driver_expires_at_ms = expires_at_ms - 10_000;
         let mut provider = make_provider(
             "codex-subscription",
             "openai-codex-oauth",
@@ -1568,7 +1740,7 @@ mod tests {
         );
         provider.credential_expires_at_ms.insert(
             crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY.to_string(),
-            expires_at_ms,
+            driver_expires_at_ms,
         );
         provider.config.insert(
             "OPENAI_BASE_URL".to_string(),
@@ -1609,7 +1781,10 @@ mod tests {
         let route = &bundle.routes[0];
         assert_eq!(route.base_url, "https://chatgpt.com/backend-api/codex");
         assert_eq!(route.request_path_override.as_deref(), Some("/responses"));
-        assert_eq!(route.credential_expires_at_ms, expires_at_ms);
+        assert_eq!(
+            route.credential_expires_at_ms, driver_expires_at_ms,
+            "resolved routes must carry the earliest credential or refresh-state expiry"
+        );
         assert_eq!(
             route.default_headers.get("chatgpt-account-id"),
             Some(&"account-route-123".to_string())
@@ -1665,6 +1840,166 @@ mod tests {
         assert!(
             wrong_strategy_bundle.routes.is_empty(),
             "a stored generic refresh strategy must not activate a Codex route"
+        );
+    }
+
+    #[test]
+    fn sandbox_selection_is_paired_and_attached() {
+        let partial = openshell_core::proto::SandboxSpec {
+            providers: vec!["grok-subscription".to_string()],
+            inference_provider: "grok-subscription".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            sandbox_inference_selection(Some(&partial))
+                .expect_err("partial selection must fail closed")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        let unattached = openshell_core::proto::SandboxSpec {
+            providers: vec!["codex-subscription".to_string()],
+            inference_provider: "grok-subscription".to_string(),
+            inference_model: "grok-4.6".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            sandbox_inference_selection(Some(&unattached))
+                .expect_err("unattached selection must fail closed")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_subscription_selection_is_explicit_and_independent() {
+        let store = test_store().await;
+        let expires_at_ms = current_time_ms() + 60_000;
+
+        let mut codex = make_provider(
+            "codex-subscription",
+            openshell_core::subscription_oauth::OPENAI_CODEX_PROVIDER_TYPE,
+            openshell_core::subscription_oauth::OPENAI_CODEX_ACCESS_TOKEN_KEY,
+            "codex-access-token-canary",
+        );
+        codex.credential_expires_at_ms.insert(
+            openshell_core::subscription_oauth::OPENAI_CODEX_ACCESS_TOKEN_KEY.to_string(),
+            expires_at_ms,
+        );
+        store.put_message(&codex).await.unwrap();
+        put_codex_refresh_state(&store, &codex, "refreshed", expires_at_ms).await;
+
+        let mut grok = make_provider(
+            "grok-subscription",
+            openshell_core::subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+            "grok-access-token-canary",
+        );
+        grok.credential_expires_at_ms.insert(
+            openshell_core::subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY.to_string(),
+            expires_at_ms,
+        );
+        grok.config.insert(
+            "XAI_BASE_URL".to_string(),
+            "https://attacker.invalid/steal".to_string(),
+        );
+        store.put_message(&grok).await.unwrap();
+        put_grok_refresh_state(&store, &grok, "refreshed", expires_at_ms).await;
+
+        // The workspace default points at Codex, but a sandbox-local Grok
+        // selection must win without mutating that shared route.
+        store
+            .put_message(&make_route(
+                CLUSTER_INFERENCE_ROUTE_NAME,
+                "codex-subscription",
+                "gpt-5-codex",
+            ))
+            .await
+            .unwrap();
+        let attached = vec![
+            "codex-subscription".to_string(),
+            "grok-subscription".to_string(),
+        ];
+
+        let grok_bundle = resolve_inference_bundle_with_selection(
+            &store,
+            "default",
+            None,
+            Some(&attached),
+            Some(("grok-subscription", "grok-4.6")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(grok_bundle.routes.len(), 1);
+        let grok_route = &grok_bundle.routes[0];
+        assert_eq!(
+            grok_route.base_url,
+            openshell_core::subscription_oauth::XAI_GROK_INFERENCE_BASE_URL
+        );
+        assert_eq!(grok_route.model_id, "grok-4.6");
+        assert_eq!(
+            grok_route.protocols,
+            vec![
+                "openai_chat_completions".to_string(),
+                "model_discovery".to_string()
+            ]
+        );
+        assert!(grok_route.request_path_override.is_none());
+        assert_eq!(grok_route.credential_expires_at_ms, expires_at_ms);
+        assert_eq!(grok_route.api_key, "grok-access-token-canary");
+        assert!(
+            !grok_route
+                .default_headers
+                .values()
+                .any(|value| value.contains("token-canary"))
+        );
+
+        let codex_bundle = resolve_inference_bundle_with_selection(
+            &store,
+            "default",
+            None,
+            Some(&attached),
+            Some(("codex-subscription", "gpt-5-codex")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(codex_bundle.routes.len(), 1);
+        assert_eq!(
+            codex_bundle.routes[0].base_url,
+            openshell_core::subscription_oauth::OPENAI_CODEX_INFERENCE_BASE_URL
+        );
+        assert_eq!(
+            codex_bundle.routes[0].request_path_override.as_deref(),
+            Some("/responses")
+        );
+
+        // An unusable earlier attachment does not hide an explicitly selected
+        // later provider, and selection never falls back to the other grant.
+        put_codex_refresh_state(&store, &codex, "reauth_required", expires_at_ms).await;
+        let still_grok = resolve_inference_bundle_with_selection(
+            &store,
+            "default",
+            None,
+            Some(&attached),
+            Some(("grok-subscription", "grok-4.6")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(still_grok.routes.len(), 1);
+        assert_eq!(still_grok.routes[0].provider_type, "xai-grok-oauth");
+
+        let unavailable_codex = resolve_inference_bundle_with_selection(
+            &store,
+            "default",
+            None,
+            Some(&attached),
+            Some(("codex-subscription", "gpt-5-codex")),
+        )
+        .await
+        .unwrap();
+        assert!(
+            unavailable_codex.routes.is_empty(),
+            "an unavailable selected provider must not fall through to another attachment"
         );
     }
 

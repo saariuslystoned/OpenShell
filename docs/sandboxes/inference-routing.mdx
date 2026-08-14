@@ -24,11 +24,11 @@ If code calls an external inference host directly, OpenShell evaluates that traf
 | Property | Detail |
 |---|---|
 | Credentials | No sandbox API keys needed. Credentials come from the configured provider record. The router strips caller-supplied `Authorization` before forwarding the request. |
-| Header forwarding | `inference.local` forwards only a per-provider header allowlist. OpenAI routes allow `openai-organization` and `x-model-id`. Anthropic routes allow `anthropic-version` and `anthropic-beta`. Vertex Claude rawPredict routes strip `anthropic-beta` and do not forward `anthropic-version` as a header because the router injects `anthropic_version` into the Vertex request body. NVIDIA routes allow `x-model-id`. AWS Bedrock routes have no passthrough headers today. All other caller headers are stripped. |
-| Configuration | One provider and one model define sandbox inference for the active gateway. Every sandbox on that gateway sees the same `inference.local` backend. |
-| Provider support | NVIDIA, Anthropic, Google Vertex AI, AWS Bedrock (via a translating bridge — direct AWS with SigV4 signing is a separate follow-up), the experimental gateway-managed OpenAI Codex subscription provider, and any OpenAI-compatible provider all work through the same endpoint. Vertex routes Claude models through `/v1/messages` and non-Anthropic models through `/v1/chat/completions`. The gateway resolves the upstream Vertex host from the provider config, including regional, global, and supported multi-region endpoints. |
+| Header forwarding | `inference.local` forwards only a per-provider header allowlist. OpenAI routes allow `openai-organization` and `x-model-id`. Anthropic routes allow `anthropic-version` and `anthropic-beta`. Vertex Claude rawPredict routes strip `anthropic-beta` and do not forward `anthropic-version` as a header because the router injects `anthropic_version` into the Vertex request body. NVIDIA routes allow `x-model-id`. Codex and Grok subscription routes allow no caller passthrough headers; Codex injects its gateway-owned routing headers. AWS Bedrock routes have no passthrough headers today. All other caller headers are stripped. |
+| Configuration | A workspace route supplies the default provider/model. A sandbox can instead pin an attached provider/model at creation time. Local selection is explicit and never depends on attachment order. |
+| Provider support | NVIDIA, Anthropic, Google Vertex AI, AWS Bedrock (via a translating bridge — direct AWS with SigV4 signing is a separate follow-up), the experimental gateway-managed Codex and Grok subscription providers, and any OpenAI-compatible provider all work through the same endpoint. Vertex routes Claude models through `/v1/messages` and non-Anthropic models through `/v1/chat/completions`. The gateway resolves the upstream Vertex host from the provider config, including regional, global, and supported multi-region endpoints. |
 | Streaming reliability | The router tolerates idle gaps of up to 120 seconds between streamed chunks so long reasoning responses are not cut off mid-stream. |
-| Hot refresh | OpenShell picks up provider credential changes and inference updates without recreating sandboxes. Changes propagate within about 5 seconds by default. |
+| Hot refresh | OpenShell picks up provider credential changes and workspace-route updates without recreating sandboxes. Changes propagate within about 5 seconds by default. A sandbox-local provider/model choice is immutable sandbox spec and is changed by recreating the sandbox. |
 
 ## Supported API Patterns
 
@@ -71,6 +71,23 @@ Today the `aws-bedrock` provider type is bridge-fronted only. The router does no
 </Note>
 
 </Tab>
+
+<Tab title="Subscription OAuth">
+
+The experimental personal-subscription adapters expose only their reviewed
+surfaces:
+
+| Provider | Pattern | Method | Sandbox path |
+|---|---|---|---|
+| OpenAI Codex | Responses | `POST` | `/v1/responses` |
+| xAI Grok | Chat Completions | `POST` | `/v1/chat/completions` |
+| xAI Grok | Model discovery | `GET` | `/v1/models` and `/v1/models/*` |
+
+Their credential-bearing upstream origins cannot be overridden. Unsupported
+OpenAI-compatible paths are denied instead of being inferred from the broader
+generic `openai` profile.
+
+</Tab>
 </Tabs>
 
 Requests to `inference.local` that do not match the configured provider's supported patterns are denied.
@@ -88,6 +105,18 @@ The managed local inference endpoint uses three values:
 | Timeout | Per-request timeout in seconds for upstream inference calls. Defaults to 60 seconds. |
 
 For tested providers and base URLs, refer to [Supported Inference Providers](/sandboxes/manage-providers#supported-inference-providers).
+
+There are two deterministic selection modes:
+
+- A workspace default created with `openshell inference set` applies when a
+  sandbox has no local selection.
+- Paired `--inference-provider` and `--inference-model` flags select one
+  provider/model for a new sandbox. The exact provider must also be attached
+  with `--provider`.
+
+OpenShell never uses provider attachment order. If the selected provider is
+missing, unattached, expired, revoked, or awaiting reauthentication, the route
+is unavailable and does not fall through to another attachment.
 
 ## Create a Provider
 
@@ -196,7 +225,7 @@ openshell inference set \
 </Tab>
 </Tabs>
 
-## Set Inference Routing
+## Set Workspace-Default Inference Routing
 
 Point `inference.local` at that provider and choose the model to use:
 
@@ -216,6 +245,22 @@ openshell inference set \
 ```
 
 The value is in seconds. When `--timeout` is omitted or set to `0`, the default of 60 seconds applies. Increase `--timeout` when you expect extended thinking phases so the full response completes before the request deadline.
+
+## Set Sandbox-Local Inference Routing
+
+Select an attached provider and model when creating a sandbox:
+
+```shell
+openshell sandbox create \
+  --name personal-model-agent \
+  --provider grok-subscription \
+  --inference-provider grok-subscription \
+  --inference-model grok-4.6
+```
+
+Both inference flags are required together. This selection overrides the
+workspace default for only that sandbox. Use it when personal subscription
+providers coexist or different sandboxes need different models.
 
 ## Inspect and Update the Config
 
@@ -325,9 +370,9 @@ curl https://inference.local/v1/responses \
 
 A successful response confirms the privacy router can reach the configured backend and the model is serving requests.
 
-- Gateway-scoped: Every sandbox using the active gateway sees the same `inference.local` backend.
+- Deterministic scope: Sandboxes without a local choice use the workspace route; sandboxes with a local choice use exactly that attached provider/model.
 - HTTPS only: `inference.local` is intercepted only for HTTPS traffic.
-- Hot reload: Provider, model, and timeout changes are picked up by running sandboxes within about 5 seconds by default. No sandbox recreation is required.
+- Hot reload: Credential and workspace-route changes are picked up by running sandboxes within about 5 seconds by default. Changing sandbox-local selection requires sandbox recreation.
 
 ## Next Steps
 

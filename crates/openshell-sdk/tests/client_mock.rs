@@ -770,6 +770,9 @@ async fn create_sandbox_passes_spec_through() {
         name: Some("my-box".to_string()),
         image: Some("ghcr.io/foo:bar".to_string()),
         labels: labels.clone(),
+        providers: vec!["grok-subscription".to_string()],
+        inference_provider: Some("grok-subscription".to_string()),
+        inference_model: Some("grok-4.6".to_string()),
         gpu: true,
         ..Default::default()
     };
@@ -794,6 +797,9 @@ async fn create_sandbox_passes_spec_through() {
         observed_spec.template.as_ref().unwrap().image,
         "ghcr.io/foo:bar"
     );
+    assert_eq!(observed_spec.providers, vec!["grok-subscription"]);
+    assert_eq!(observed_spec.inference_provider, "grok-subscription");
+    assert_eq!(observed_spec.inference_model, "grok-4.6");
 }
 
 #[tokio::test]

@@ -31,8 +31,10 @@ func TestSandboxFromProto(t *testing.T) {
 			DeletionTimestampMs: 1700000060000,
 		},
 		Spec: &pb.SandboxSpec{
-			LogLevel:    "debug",
-			Environment: map[string]string{"FOO": "bar"},
+			LogLevel:          "debug",
+			Environment:       map[string]string{"FOO": "bar"},
+			InferenceProvider: "grok",
+			InferenceModel:    "grok-4.6",
 			Template: &pb.SandboxTemplate{
 				Image:            "nvidia/sandbox:latest",
 				RuntimeClassName: "kata",
@@ -93,6 +95,8 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "debug", s.Spec.LogLevel)
 	assert.Equal(t, map[string]string{"FOO": "bar"}, s.Spec.Environment)
 	assert.Equal(t, []string{"claude", "github"}, s.Spec.Providers)
+	assert.Equal(t, "grok", s.Spec.InferenceProvider)
+	assert.Equal(t, "grok-4.6", s.Spec.InferenceModel)
 	require.NotNil(t, s.Spec.GPUCount)
 	assert.Equal(t, uint32(2), *s.Spec.GPUCount)
 
@@ -401,8 +405,10 @@ func TestSandboxRoundTrip(t *testing.T) {
 func TestSandboxSpecToProto(t *testing.T) {
 	gpuCount := uint32(3)
 	spec := &v1.SandboxSpec{
-		LogLevel:    "debug",
-		Environment: map[string]string{"X": "Y"},
+		LogLevel:          "debug",
+		Environment:       map[string]string{"X": "Y"},
+		InferenceProvider: "codex",
+		InferenceModel:    "gpt-5.3-codex",
 		Template: &v1.SandboxTemplate{
 			Image:        "img:spec",
 			Resources:    map[string]any{"cpu": "4"},
@@ -424,6 +430,8 @@ func TestSandboxSpecToProto(t *testing.T) {
 	assert.Equal(t, "debug", p.LogLevel)
 	assert.Equal(t, map[string]string{"X": "Y"}, p.Environment)
 	assert.Equal(t, []string{"prov"}, p.Providers)
+	assert.Equal(t, "codex", p.InferenceProvider)
+	assert.Equal(t, "gpt-5.3-codex", p.InferenceModel)
 	require.NotNil(t, p.ResourceRequirements)
 	assert.Equal(t, uint32(3), p.ResourceRequirements.Gpu.GetCount())
 	require.NotNil(t, p.Template)
