@@ -34,6 +34,9 @@ merge, or upstream pull request occurred.
 - Public source-and-proof checkpoint:
   `7ab45643cfd7c638089877193c89ffdd65ae0392` (tree
   `30e66f8b2392a93c98c89e0bdc9cd445696c613d`).
+- Public fail-closed route-cache checkpoint:
+  `70a55867d56f9646d97c1a8d896438ae850c7730` (tree
+  `4dd97d718f46e2b0acd5b6e29250ef3b7f1af3fa`).
 - Public fork branch:
   <https://github.com/saariuslystoned/OpenShell/tree/codex/2740-openai-codex-oauth>.
 - Official Codex source was initially audited at
