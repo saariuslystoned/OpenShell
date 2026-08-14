@@ -19,6 +19,7 @@ fn mock_candidates(base_url: &str) -> Vec<ResolvedRoute> {
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         model_in_path: false,
         request_path_override: None,
+        credential_expires_at_ms: 0,
     }]
 }
 
@@ -125,6 +126,7 @@ async fn proxy_no_compatible_route_returns_error() {
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         model_in_path: false,
         request_path_override: None,
+        credential_expires_at_ms: 0,
     }];
 
     let err = router
@@ -223,6 +225,7 @@ async fn proxy_mock_route_returns_canned_response() {
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         model_in_path: false,
         request_path_override: None,
+        credential_expires_at_ms: 0,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -250,6 +253,79 @@ async fn proxy_mock_route_returns_canned_response() {
         resp_body["choices"][0]["message"]["content"],
         "Hello from openshell mock backend"
     );
+}
+
+#[tokio::test]
+async fn expired_cached_route_is_skipped_on_every_request() {
+    let router = Router::new().unwrap();
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after Unix epoch")
+            .as_millis(),
+    )
+    .expect("current Unix time should fit in i64 milliseconds");
+    let expired_at_ms = now_ms - 1;
+    let candidates = vec![
+        ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint: "http://expired-route.invalid".to_string(),
+            model: "expired-model".to_string(),
+            api_key: "expired-key".to_string(),
+            protocols: vec!["openai_chat_completions".to_string()],
+            auth: AuthHeader::Bearer,
+            default_headers: Vec::new(),
+            passthrough_headers: Vec::new(),
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
+            credential_expires_at_ms: expired_at_ms,
+        },
+        ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint: "mock://fresh".to_string(),
+            model: "fresh-model".to_string(),
+            api_key: "fresh-key".to_string(),
+            protocols: vec!["openai_chat_completions".to_string()],
+            auth: AuthHeader::Bearer,
+            default_headers: Vec::new(),
+            passthrough_headers: Vec::new(),
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
+            credential_expires_at_ms: now_ms + 60_000,
+        },
+    ];
+
+    let response = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![],
+            bytes::Bytes::new(),
+            &candidates,
+        )
+        .await
+        .expect("fresh fallback route should be selected");
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["model"], "fresh-model");
+
+    let err = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![],
+            bytes::Bytes::new(),
+            &candidates[..1],
+        )
+        .await
+        .expect_err("an expired cached route must fail closed");
+    assert!(matches!(
+        err,
+        openshell_router::RouterError::NoCompatibleRoute(_)
+    ));
 }
 
 #[tokio::test]
@@ -364,6 +440,7 @@ async fn proxy_uses_x_api_key_for_anthropic_route() {
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         model_in_path: false,
         request_path_override: None,
+        credential_expires_at_ms: 0,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -429,6 +506,7 @@ async fn proxy_anthropic_does_not_send_bearer_auth() {
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         model_in_path: false,
         request_path_override: None,
+        credential_expires_at_ms: 0,
     }];
 
     let response = router
@@ -480,6 +558,7 @@ async fn proxy_forwards_client_anthropic_version_header() {
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         model_in_path: false,
         request_path_override: None,
+        credential_expires_at_ms: 0,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -510,6 +589,71 @@ async fn proxy_forwards_client_anthropic_version_header() {
         response.status, 200,
         "upstream should have received anthropic-version header"
     );
+}
+
+#[tokio::test]
+async fn proxy_uses_gateway_owned_codex_headers_over_hostile_caller_values() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .and(bearer_token("gateway-access-token"))
+        .and(header("ChatGPT-Account-ID", "gateway-account"))
+        .and(header("X-OpenAI-FedRAMP", "true"))
+        .and(header("originator", "openshell"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
+        endpoint: format!("{}/backend-api/codex", mock_server.uri()),
+        model: "gpt-5.3-codex".to_string(),
+        api_key: "gateway-access-token".to_string(),
+        protocols: vec!["openai_responses".to_string()],
+        auth: AuthHeader::Bearer,
+        default_headers: vec![
+            (
+                "ChatGPT-Account-ID".to_string(),
+                "gateway-account".to_string(),
+            ),
+            ("X-OpenAI-FedRAMP".to_string(), "true".to_string()),
+            ("originator".to_string(), "openshell".to_string()),
+        ],
+        passthrough_headers: vec![
+            "chatgpt-account-id".to_string(),
+            "x-openai-fedramp".to_string(),
+            "originator".to_string(),
+        ],
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        model_in_path: false,
+        request_path_override: Some("/responses".to_string()),
+        credential_expires_at_ms: 0,
+    }];
+
+    let response = router
+        .proxy_with_candidates(
+            "openai_responses",
+            "POST",
+            "/responses",
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                (
+                    "ChatGPT-Account-ID".to_string(),
+                    "hostile-account".to_string(),
+                ),
+                ("X-OpenAI-FedRAMP".to_string(), "false".to_string()),
+                ("originator".to_string(), "hostile-client".to_string()),
+                ("authorization".to_string(), "Bearer hostile".to_string()),
+            ],
+            bytes::Bytes::from_static(br#"{"model":"hostile-model","input":"hello"}"#),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
 }
 
 #[tokio::test]
@@ -554,6 +698,7 @@ async fn proxy_vertex_gemini_route_uses_chat_completions_override() {
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         model_in_path: false,
         request_path_override: Some("/chat/completions".to_string()),
+        credential_expires_at_ms: 0,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -615,6 +760,7 @@ async fn proxy_vertex_anthropic_route_uses_model_path_suffix() {
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         model_in_path: true,
         request_path_override: Some(":rawPredict".to_string()),
+        credential_expires_at_ms: 0,
     }];
 
     // Include "model" in the body, as Claude Code and other Anthropic SDK
@@ -742,6 +888,7 @@ async fn proxy_vertex_strips_beta_fields_e2e() {
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         model_in_path: true,
         request_path_override: Some(":rawPredict".to_string()),
+        credential_expires_at_ms: 0,
     }];
 
     // Exact payload Claude Code v2.1.156+ sends: includes model,
@@ -810,6 +957,7 @@ async fn proxy_vertex_anthropic_streaming_route_uses_stream_rawpredict() {
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         model_in_path: true,
         request_path_override: Some(":rawPredict".to_string()),
+        credential_expires_at_ms: 0,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -902,6 +1050,7 @@ async fn streaming_proxy_completes_despite_exceeding_route_timeout() {
         timeout: Duration::from_secs(1),
         model_in_path: false,
         request_path_override: None,
+        credential_expires_at_ms: 0,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -966,6 +1115,7 @@ async fn buffered_proxy_enforces_route_timeout() {
         timeout: Duration::from_secs(1),
         model_in_path: false,
         request_path_override: None,
+        credential_expires_at_ms: 0,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({

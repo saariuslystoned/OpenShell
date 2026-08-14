@@ -85,6 +85,7 @@ impl Inference for InferenceService {
             self.state.store.as_ref(),
             workspace,
             Some(&self.state.credentials),
+            sandbox.spec.as_ref().map(|spec| spec.providers.as_slice()),
         )
         .await
         .map(Response::new)
@@ -295,7 +296,13 @@ async fn upsert_cluster_inference_route_with_credentials(
         })?;
     let provider = resolve_provider_credentials(provider, credentials).await?;
 
-    let resolved = resolve_provider_route(&provider, model_id)?;
+    let mut resolved = resolve_provider_route(&provider, model_id)?;
+    if resolved.provider_type == "openai-codex-oauth" {
+        let context = openai_codex_route_context(store, workspace, &provider, true)
+            .await?
+            .expect("required Codex route context returns Some");
+        apply_openai_codex_route_context(&mut resolved, context);
+    }
     let validation = if verify {
         vec![verify_provider_endpoint(provider.object_name(), model_id, &resolved).await?]
     } else {
@@ -383,6 +390,85 @@ fn build_inference_route_config(
 struct ResolvedProviderRoute {
     provider_type: String,
     route: RouterResolvedRoute,
+    credential_expires_at_ms: i64,
+}
+
+struct OpenAiCodexRouteContext {
+    account_id: String,
+    fedramp: bool,
+    expires_at_ms: i64,
+}
+
+async fn openai_codex_route_context(
+    store: &Store,
+    workspace: &str,
+    provider: &Provider,
+    required: bool,
+) -> Result<Option<OpenAiCodexRouteContext>, Status> {
+    let unavailable = |message: &'static str| {
+        if required {
+            Err(Status::failed_precondition(message))
+        } else {
+            Ok(None)
+        }
+    };
+    let Some(refresh) = crate::provider_refresh::get_refresh_state(
+        store,
+        workspace,
+        provider.object_id(),
+        crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+    )
+    .await?
+    else {
+        return unavailable("OpenAI Codex subscription provider is not signed in");
+    };
+    if refresh.status != "refreshed" {
+        return unavailable("OpenAI Codex subscription provider is not active");
+    }
+    if refresh.expires_at_ms <= current_time_ms() {
+        return unavailable("OpenAI Codex subscription access token is expired");
+    }
+    let Some(account_id) = refresh
+        .material
+        .get("account_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return unavailable("OpenAI Codex subscription provider is missing account routing");
+    };
+    if account_id.len() > 512 || account_id.parse::<reqwest::header::HeaderValue>().is_err() {
+        return unavailable("OpenAI Codex subscription account routing is invalid");
+    }
+    let fedramp = match refresh.material.get("fedramp").map(String::as_str) {
+        None | Some("" | "false") => false,
+        Some("true") => true,
+        Some(_) => {
+            return unavailable("OpenAI Codex subscription FedRAMP routing is invalid");
+        }
+    };
+    Ok(Some(OpenAiCodexRouteContext {
+        account_id: account_id.to_string(),
+        fedramp,
+        expires_at_ms: refresh.expires_at_ms,
+    }))
+}
+
+fn apply_openai_codex_route_context(
+    resolved: &mut ResolvedProviderRoute,
+    context: OpenAiCodexRouteContext,
+) {
+    resolved
+        .route
+        .default_headers
+        .push(("chatgpt-account-id".to_string(), context.account_id));
+    if context.fedramp {
+        resolved
+            .route
+            .default_headers
+            .push(("x-openai-fedramp".to_string(), "true".to_string()));
+    }
+    resolved.credential_expires_at_ms = context.expires_at_ms;
 }
 
 #[derive(Debug)]
@@ -669,6 +755,7 @@ fn build_vertex_route(
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         model_in_path,
         request_path_override,
+        credential_expires_at_ms: 0,
     }
 }
 
@@ -793,7 +880,7 @@ fn resolve_provider_route(
     let profile = openshell_core::inference::profile_for(&provider_type).ok_or_else(|| {
         Status::invalid_argument(format!(
             "provider '{name}' has unsupported type '{raw_provider_type}' for cluster inference \
-                 (supported: openai, anthropic, nvidia, deepinfra, google-vertex-ai, aws-bedrock)",
+                 (supported: openai, openai-codex-oauth, anthropic, nvidia, deepinfra, google-vertex-ai, aws-bedrock)",
             name = provider.object_name()
         ))
     })?;
@@ -801,24 +888,24 @@ fn resolve_provider_route(
     // Profiles with `auth: None` are bridge-fronted — the upstream
     // authenticates itself, so the router doesn't need a credential at
     // route-resolution time. Today this is `aws-bedrock`.
+    let credential_lookup = if matches!(
+        provider_type.as_str(),
+        "google-vertex-ai" | "openai-codex-oauth"
+    ) {
+        CredentialLookup::PreferredOnly
+    } else {
+        CredentialLookup::PreferredThenAny
+    };
     let api_key = if matches!(profile.auth, openshell_core::inference::AuthHeader::None) {
         String::new()
     } else {
-        find_provider_api_key(
-            provider,
-            profile.credential_key_names,
-            if provider_type == "google-vertex-ai" {
-                CredentialLookup::PreferredOnly
-            } else {
-                CredentialLookup::PreferredThenAny
-            },
-        )
-        .ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "provider '{name}' has no usable API key credential",
-                name = provider.object_name()
-            ))
-        })?
+        find_provider_api_key(provider, profile.credential_key_names, credential_lookup)
+            .ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "provider '{name}' has no usable API key credential",
+                    name = provider.object_name()
+                ))
+            })?
     };
 
     // Vertex AI requires a model-aware URL; delegate to specialised resolver.
@@ -833,6 +920,10 @@ fn resolve_provider_route(
         return Ok(ResolvedProviderRoute {
             provider_type,
             route,
+            credential_expires_at_ms: provider_credential_expiry(
+                provider,
+                profile.credential_key_names,
+            ),
         });
     }
 
@@ -858,6 +949,11 @@ fn resolve_provider_route(
         )));
     }
 
+    let request_path_override = if provider_type == "openai-codex-oauth" {
+        Some("/responses".to_string())
+    } else {
+        None
+    };
     Ok(ResolvedProviderRoute {
         provider_type,
         route: RouterResolvedRoute {
@@ -879,9 +975,25 @@ fn resolve_provider_route(
                 .collect(),
             timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
-            request_path_override: None,
+            request_path_override,
+            credential_expires_at_ms: provider_credential_expiry(
+                provider,
+                profile.credential_key_names,
+            ),
         },
+        credential_expires_at_ms: provider_credential_expiry(
+            provider,
+            profile.credential_key_names,
+        ),
     })
+}
+
+fn provider_credential_expiry(provider: &Provider, keys: &[&str]) -> i64 {
+    keys.iter()
+        .filter_map(|key| provider.credential_expires_at_ms.get(*key).copied())
+        .filter(|expiry| *expiry > 0)
+        .min()
+        .unwrap_or_default()
 }
 
 fn validation_failure(
@@ -1020,13 +1132,14 @@ async fn resolve_inference_bundle(
     store: &Store,
     workspace: &str,
 ) -> Result<GetInferenceBundleResponse, Status> {
-    resolve_inference_bundle_with_credentials(store, workspace, None).await
+    resolve_inference_bundle_with_credentials(store, workspace, None, None).await
 }
 
 async fn resolve_inference_bundle_with_credentials(
     store: &Store,
     workspace: &str,
     credentials: Option<&crate::credentials::CredentialRuntime>,
+    attached_provider_names: Option<&[String]>,
 ) -> Result<GetInferenceBundleResponse, Status> {
     let mut routes = Vec::new();
     if let Some(r) = resolve_route_by_name_with_credentials(
@@ -1034,6 +1147,7 @@ async fn resolve_inference_bundle_with_credentials(
         workspace,
         credentials,
         CLUSTER_INFERENCE_ROUTE_NAME,
+        attached_provider_names,
     )
     .await?
     {
@@ -1044,6 +1158,7 @@ async fn resolve_inference_bundle_with_credentials(
         workspace,
         credentials,
         SANDBOX_SYSTEM_ROUTE_NAME,
+        attached_provider_names,
     )
     .await?
     {
@@ -1072,6 +1187,10 @@ async fn resolve_inference_bundle_with_credentials(
             r.timeout_secs.hash(&mut hasher);
             r.model_in_path.hash(&mut hasher);
             r.request_path_override.hash(&mut hasher);
+            r.credential_expires_at_ms.hash(&mut hasher);
+            let mut headers = r.default_headers.iter().collect::<Vec<_>>();
+            headers.sort_by(|left, right| left.0.cmp(right.0));
+            headers.hash(&mut hasher);
         }
         format!("{:016x}", hasher.finish())
     };
@@ -1089,7 +1208,7 @@ async fn resolve_route_by_name(
     workspace: &str,
     route_name: &str,
 ) -> Result<Option<ResolvedRoute>, Status> {
-    resolve_route_by_name_with_credentials(store, workspace, None, route_name).await
+    resolve_route_by_name_with_credentials(store, workspace, None, route_name, None).await
 }
 
 async fn resolve_route_by_name_with_credentials(
@@ -1097,6 +1216,7 @@ async fn resolve_route_by_name_with_credentials(
     workspace: &str,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     route_name: &str,
+    attached_provider_names: Option<&[String]>,
 ) -> Result<Option<ResolvedRoute>, Status> {
     let route = store
         .get_message_by_name::<InferenceRoute>(workspace, route_name)
@@ -1133,9 +1253,37 @@ async fn resolve_route_by_name_with_credentials(
                 config.provider_name
             ))
         })?;
+    let provider_type =
+        normalize_provider_type(provider.r#type.trim()).unwrap_or_else(|| provider.r#type.trim());
+    let profile = openshell_core::inference::profile_for(provider_type);
+    if profile.is_some_and(|profile| profile.requires_provider_attachment)
+        && !attached_provider_names
+            .is_some_and(|names| names.iter().any(|name| name == provider.object_name()))
+    {
+        return Ok(None);
+    }
+    let codex_context = if provider_type == "openai-codex-oauth" {
+        let Some(context) = openai_codex_route_context(store, workspace, &provider, false).await?
+        else {
+            return Ok(None);
+        };
+        Some(context)
+    } else {
+        None
+    };
     let provider = resolve_provider_credentials(provider, credentials).await?;
 
-    let resolved = resolve_provider_route(&provider, &config.model_id)?;
+    let mut resolved = resolve_provider_route(&provider, &config.model_id)?;
+    if let Some(context) = codex_context {
+        apply_openai_codex_route_context(&mut resolved, context);
+    }
+    if resolved.credential_expires_at_ms > 0
+        && resolved.credential_expires_at_ms <= current_time_ms()
+    {
+        return Ok(None);
+    }
+
+    let default_headers = resolved.route.default_headers.into_iter().collect();
 
     Ok(Some(ResolvedRoute {
         name: route_name.to_string(),
@@ -1147,6 +1295,8 @@ async fn resolve_route_by_name_with_credentials(
         timeout_secs: config.timeout_secs,
         model_in_path: resolved.route.model_in_path,
         request_path_override: resolved.route.request_path_override,
+        credential_expires_at_ms: resolved.credential_expires_at_ms,
+        default_headers,
     }))
 }
 
@@ -1271,6 +1421,48 @@ mod tests {
         }
     }
 
+    async fn put_codex_refresh_state(
+        store: &Store,
+        provider: &Provider,
+        status: &str,
+        expires_at_ms: i64,
+    ) {
+        let mut refresh = crate::provider_refresh::new_refresh_state(
+            provider,
+            "default",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy:
+                    openshell_core::proto::ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+                material: HashMap::from([
+                    (
+                        "refresh_token".to_string(),
+                        "refresh-token-canary".to_string(),
+                    ),
+                    ("account_id".to_string(), "account-route-123".to_string()),
+                    ("fedramp".to_string(), "true".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms,
+                token_url: "https://auth.openai.com/oauth/token".to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .expect("Codex refresh state");
+        refresh.status = status.to_string();
+        refresh.expires_at_ms = expires_at_ms;
+        crate::provider_refresh::put_refresh_state(store, &refresh)
+            .await
+            .expect("persist Codex refresh state");
+    }
+
     fn make_provider_with_base_url(
         name: &str,
         provider_type: &str,
@@ -1297,6 +1489,7 @@ mod tests {
             auth: openshell_core::inference::AuthHeader::Bearer,
             default_headers: &[],
             passthrough_headers: &[],
+            requires_provider_attachment: false,
         };
         let result = resolve_vertex_ai_route(&config, "model-id", "route", "api-key", &profile);
         // Empty base_url_config_keys must not panic. The route still errors because
@@ -1330,6 +1523,7 @@ mod tests {
             auth: openshell_core::inference::AuthHeader::Bearer,
             default_headers: &[],
             passthrough_headers: &[],
+            requires_provider_attachment: false,
         };
 
         let result = resolve_vertex_ai_route(&config, "model-id", "route", "api-key", &profile);
@@ -1355,6 +1549,94 @@ mod tests {
 
         let err = authorize_inference_bundle(None).expect_err("missing principal rejected");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn codex_subscription_bundle_requires_exact_attachment_and_live_grant() {
+        let store = test_store().await;
+        let expires_at_ms = current_time_ms() + 60_000;
+        let mut provider = make_provider(
+            "codex-subscription",
+            "openai-codex-oauth",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            "access-token-canary",
+        );
+        provider.credential_expires_at_ms.insert(
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY.to_string(),
+            expires_at_ms,
+        );
+        provider.config.insert(
+            "OPENAI_BASE_URL".to_string(),
+            "https://attacker.invalid/steal".to_string(),
+        );
+        store.put_message(&provider).await.unwrap();
+        put_codex_refresh_state(&store, &provider, "refreshed", expires_at_ms).await;
+        store
+            .put_message(&make_route(
+                CLUSTER_INFERENCE_ROUTE_NAME,
+                "codex-subscription",
+                "gpt-5-codex",
+            ))
+            .await
+            .unwrap();
+
+        let missing_attachment_metadata =
+            resolve_inference_bundle_with_credentials(&store, "default", None, None)
+                .await
+                .unwrap();
+        assert!(
+            missing_attachment_metadata.routes.is_empty(),
+            "missing sandbox attachment metadata must fail closed"
+        );
+
+        let unattached =
+            resolve_inference_bundle_with_credentials(&store, "default", None, Some(&[]))
+                .await
+                .unwrap();
+        assert!(unattached.routes.is_empty());
+
+        let attached = vec!["codex-subscription".to_string()];
+        let bundle =
+            resolve_inference_bundle_with_credentials(&store, "default", None, Some(&attached))
+                .await
+                .unwrap();
+        assert_eq!(bundle.routes.len(), 1);
+        let route = &bundle.routes[0];
+        assert_eq!(route.base_url, "https://chatgpt.com/backend-api/codex");
+        assert_eq!(route.request_path_override.as_deref(), Some("/responses"));
+        assert_eq!(route.credential_expires_at_ms, expires_at_ms);
+        assert_eq!(
+            route.default_headers.get("chatgpt-account-id"),
+            Some(&"account-route-123".to_string())
+        );
+        assert_eq!(
+            route.default_headers.get("x-openai-fedramp"),
+            Some(&"true".to_string())
+        );
+        assert!(
+            !route
+                .default_headers
+                .values()
+                .any(|value| { value == "access-token-canary" || value == "refresh-token-canary" })
+        );
+
+        for unavailable_status in [
+            "publishing",
+            "error",
+            "reauth_required",
+            "revoking",
+            "revoke_failed",
+        ] {
+            put_codex_refresh_state(&store, &provider, unavailable_status, expires_at_ms).await;
+            let unavailable =
+                resolve_inference_bundle_with_credentials(&store, "default", None, Some(&attached))
+                    .await
+                    .unwrap();
+            assert!(
+                unavailable.routes.is_empty(),
+                "{unavailable_status} grants must never be routed"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1915,6 +2197,7 @@ mod tests {
             "default",
             Some(&credentials),
             CLUSTER_INFERENCE_ROUTE_NAME,
+            None,
         )
         .await
         .expect("route should resolve")

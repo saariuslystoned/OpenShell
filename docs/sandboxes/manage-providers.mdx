@@ -408,6 +408,7 @@ The following providers have been tested with `inference.local`. Any provider th
 
 | Provider | Name | Type | Base URL | API Key Variable |
 |---|---|---|---|---|
+| OpenAI Codex subscription (experimental) | `codex-subscription` | `openai-codex-oauth` | Pinned Codex subscription backend | None; separate gateway-managed Sign in with ChatGPT grant |
 | AWS Bedrock (via bridge) | `bedrock-bridge` | `aws-bedrock` | Operator-supplied `BEDROCK_BASE_URL` | None at router level (bridge holds creds) |
 | NVIDIA API Catalog | `nvidia-prod` | `nvidia` | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` |
 | Anthropic | `anthropic-prod` | `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
@@ -419,7 +420,7 @@ The following providers have been tested with `inference.local`. Any provider th
 | Ollama (local) | `ollama` | `openai` | `http://host.openshell.internal:11434/v1` | `OPENAI_API_KEY` |
 | LM Studio (local) | `lmstudio` | `openai` | `http://host.openshell.internal:1234/v1` | `OPENAI_API_KEY` |
 
-Refer to your provider's documentation for the correct base URL, available models, and API key setup. For the Vertex-specific auth flows and config keys, refer to [Google Vertex AI](/providers/google-vertex-ai). To configure inference routing, refer to [Inference Routing](/sandboxes/inference-routing).
+Refer to your provider's documentation for the correct base URL, available models, and API key setup. For the gateway-managed subscription flow, refer to [OpenAI Codex Subscription](/providers/openai-codex-subscription). For the Vertex-specific auth flows and config keys, refer to [Google Vertex AI](/providers/google-vertex-ai). To configure inference routing, refer to [Inference Routing](/sandboxes/inference-routing).
 
 ## Next Steps
 

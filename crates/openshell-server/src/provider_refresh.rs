@@ -6,6 +6,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::persistence::{ObjectType, PersistenceError, Store, WriteCondition, current_time_ms};
+use base64::Engine as _;
 use openshell_core::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
@@ -23,6 +24,11 @@ const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
 const REFRESH_ERROR_RETRY_SECONDS: i64 = 60;
 const REFRESH_WORKER_PAGE_SIZE: u32 = 1000;
+pub const OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY: &str = "OPENAI_CODEX_OAUTH_ACCESS_TOKEN";
+const MAX_OPENAI_CODEX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
+pub const OPENAI_CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const OPENAI_CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_CODEX_OAUTH_REVOKE_URL: &str = "https://auth.openai.com/oauth/revoke";
 
 impl ObjectType for StoredProviderCredentialRefreshState {
     fn object_type() -> &'static str {
@@ -57,7 +63,7 @@ pub async fn put_refresh_state(
 /// stored source-credential material is not recreated (CWE-362). Returns the new
 /// resource version when persisted, or `None` when the refresh was deleted or
 /// superseded by a concurrent write (in which case nothing was written).
-async fn persist_refresh_state_if_current(
+pub async fn persist_refresh_state_if_current(
     store: &Store,
     state: &StoredProviderCredentialRefreshState,
     expected_version: u64,
@@ -209,6 +215,7 @@ pub fn refresh_status_from_state(
         next_refresh_at_ms: state.next_refresh_at_ms,
         last_refresh_at_ms: state.last_refresh_at_ms,
         last_error: state.last_error.clone(),
+        refresh_generation_id: state.refresh_generation_id.clone(),
     }
 }
 
@@ -270,6 +277,7 @@ pub fn new_refresh_state(
         refresh_before_seconds: config.refresh_before_seconds,
         max_lifetime_seconds: config.max_lifetime_seconds,
         additional_output_keys: config.additional_output_keys,
+        refresh_generation_id: uuid::Uuid::new_v4().to_string(),
     })
 }
 
@@ -279,6 +287,7 @@ struct MintedCredential {
     expires_at_ms: i64,
     refresh_token: Option<String>,
     additional_credentials: HashMap<String, String>,
+    material_updates: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -333,6 +342,7 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::OpenaiCodexOauth => "openai_codex_oauth",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -340,6 +350,19 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
 pub use openshell_providers::is_gateway_mintable_strategy;
 
 pub async fn refresh_provider_credential(
+    operation_mutex: &tokio::sync::Mutex<()>,
+    store: &Store,
+    workspace: &str,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    provider_name: &str,
+    credential_key: &str,
+) -> Result<StoredProviderCredentialRefreshState, Status> {
+    let _operation_guard = operation_mutex.lock().await;
+    refresh_provider_credential_inner(store, workspace, credentials, provider_name, credential_key)
+        .await
+}
+
+async fn refresh_provider_credential_inner(
     store: &Store,
     workspace: &str,
     credentials: Option<&crate::credentials::CredentialRuntime>,
@@ -363,6 +386,15 @@ pub async fn refresh_provider_credential(
         .metadata
         .as_ref()
         .map_or(0, |meta| meta.resource_version);
+
+    if ProviderCredentialRefreshStrategy::try_from(state.strategy)
+        == Ok(ProviderCredentialRefreshStrategy::OpenaiCodexOauth)
+        && matches!(state.status.as_str(), "revoking" | "revoke_failed")
+    {
+        return Err(Status::failed_precondition(
+            "OpenAI Codex grant revocation is pending",
+        ));
+    }
 
     info!(
         provider = %state.provider_name,
@@ -398,6 +430,8 @@ pub async fn refresh_provider_credential(
     match mint_credential(&state).await {
         Ok(minted) => {
             let now_ms = current_time_ms();
+            let codex_publish = ProviderCredentialRefreshStrategy::try_from(state.strategy)
+                == Ok(ProviderCredentialRefreshStrategy::OpenaiCodexOauth);
             if let Some(ref refresh_token) = minted.refresh_token {
                 state
                     .material
@@ -410,6 +444,9 @@ pub async fn refresh_provider_credential(
                     state.secret_material_keys.push("refresh_token".to_string());
                 }
             }
+            for (key, value) in &minted.material_updates {
+                state.material.insert(key.clone(), value.clone());
+            }
             state.expires_at_ms = minted.expires_at_ms;
             state.next_refresh_at_ms = next_refresh_at_ms(
                 minted.expires_at_ms,
@@ -418,7 +455,16 @@ pub async fn refresh_provider_credential(
                 now_ms,
             );
             state.last_refresh_at_ms = now_ms;
-            state.status = "refreshed".to_string();
+            // Codex route metadata (account/FedRAMP) lives in this state while
+            // the access token lives on the provider. Publish an intermediate,
+            // unroutable state first, then mark it refreshed only after the
+            // provider credential commit succeeds. This prevents a bundle read
+            // from combining new account routing with the predecessor token.
+            state.status = if codex_publish {
+                "publishing".to_string()
+            } else {
+                "refreshed".to_string()
+            };
             state.last_error.clear();
 
             // Claim the refresh generation with a version-matched write BEFORE
@@ -473,6 +519,21 @@ pub async fn refresh_provider_credential(
                 );
                 return Err(err);
             }
+            if codex_publish {
+                state.status = "refreshed".to_string();
+                let Some(_) = persist_refresh_state_if_current(store, &state, new_version).await?
+                else {
+                    warn!(
+                        provider = %state.provider_name,
+                        credential_key = %state.credential_key,
+                        strategy = %refresh_strategy_name(state.strategy),
+                        "provider credential published but refresh state was superseded; route remains unavailable"
+                    );
+                    return Err(Status::aborted(
+                        "provider refresh was superseded while publishing credentials",
+                    ));
+                };
+            }
             info!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
@@ -487,10 +548,20 @@ pub async fn refresh_provider_credential(
         }
         Err(err) => {
             let now_ms = current_time_ms();
-            state.status = "error".to_string();
+            let terminal_codex_grant = ProviderCredentialRefreshStrategy::try_from(state.strategy)
+                == Ok(ProviderCredentialRefreshStrategy::OpenaiCodexOauth)
+                && err.code() == tonic::Code::FailedPrecondition;
+            state.status = if terminal_codex_grant {
+                "reauth_required".to_string()
+            } else {
+                "error".to_string()
+            };
             state.last_error = err.message().to_string();
-            state.next_refresh_at_ms =
-                now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000));
+            state.next_refresh_at_ms = if terminal_codex_grant {
+                0
+            } else {
+                now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000))
+            };
             persist_refresh_state_if_current(store, &state, expected_version).await?;
             warn!(
                 provider = %state.provider_name,
@@ -729,6 +800,7 @@ async fn mint_credential(
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
             mint_aws_sts_assume_role(state).await
         }
+        ProviderCredentialRefreshStrategy::OpenaiCodexOauth => mint_openai_codex_oauth(state).await,
         ProviderCredentialRefreshStrategy::External
         | ProviderCredentialRefreshStrategy::Static
         | ProviderCredentialRefreshStrategy::Unspecified => Err(Status::failed_precondition(
@@ -776,6 +848,275 @@ async fn mint_oauth2_client_credentials(
     }
 
     request_token(&token_url, &form, state.max_lifetime_seconds).await
+}
+
+#[derive(Deserialize)]
+#[allow(clippy::struct_field_names)]
+struct OpenAiCodexRefreshResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JwtExpiryClaims {
+    exp: i64,
+}
+
+#[derive(Deserialize)]
+struct OpenAiCodexIdClaims {
+    #[serde(rename = "https://api.openai.com/auth")]
+    auth: Option<OpenAiCodexAuthClaims>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiCodexAuthClaims {
+    chatgpt_account_id: Option<String>,
+    #[serde(default)]
+    chatgpt_account_is_fedramp: bool,
+}
+
+fn decode_jwt_claims<T: for<'de> Deserialize<'de>>(jwt: &str) -> Result<T, Status> {
+    let mut parts = jwt.split('.');
+    let (Some(header), Some(payload), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(Status::failed_precondition(
+            "OpenAI Codex OAuth returned a malformed JWT; sign in again",
+        ));
+    };
+    if header.is_empty() || payload.is_empty() || signature.is_empty() {
+        return Err(Status::failed_precondition(
+            "OpenAI Codex OAuth returned a malformed JWT; sign in again",
+        ));
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| {
+            Status::failed_precondition(
+                "OpenAI Codex OAuth returned a malformed JWT; sign in again",
+            )
+        })?;
+    serde_json::from_slice(&decoded).map_err(|_| {
+        Status::failed_precondition("OpenAI Codex OAuth returned invalid claims; sign in again")
+    })
+}
+
+fn jwt_expiry_ms(jwt: &str) -> Result<i64, Status> {
+    let claims: JwtExpiryClaims = decode_jwt_claims(jwt)?;
+    let expiry_ms = claims.exp.saturating_mul(1000);
+    if expiry_ms <= current_time_ms() {
+        return Err(Status::failed_precondition(
+            "OpenAI Codex OAuth returned an expired access token; sign in again",
+        ));
+    }
+    Ok(expiry_ms)
+}
+
+fn codex_account_claims(id_token: &str) -> Result<(String, bool), Status> {
+    let claims: OpenAiCodexIdClaims = decode_jwt_claims(id_token)?;
+    let auth = claims.auth.ok_or_else(|| {
+        Status::failed_precondition("OpenAI Codex OAuth response is missing account claims")
+    })?;
+    let account_id = auth
+        .chatgpt_account_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition("OpenAI Codex OAuth response is missing account id")
+        })?;
+    Ok((account_id, auth.chatgpt_account_is_fedramp))
+}
+
+fn codex_auth_endpoint(state: &StoredProviderCredentialRefreshState, revoke: bool) -> String {
+    #[cfg(test)]
+    if let Some(base) = state.material.get("test_auth_base_url") {
+        return format!(
+            "{}/oauth/{}",
+            base.trim_end_matches('/'),
+            if revoke { "revoke" } else { "token" }
+        );
+    }
+    #[cfg(not(test))]
+    let _ = state;
+    if revoke {
+        OPENAI_CODEX_OAUTH_REVOKE_URL.to_string()
+    } else {
+        OPENAI_CODEX_OAUTH_TOKEN_URL.to_string()
+    }
+}
+
+fn codex_refresh_failure(status: reqwest::StatusCode, body: &[u8]) -> Status {
+    let code = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| match error {
+                    serde_json::Value::String(code) => Some(code.as_str()),
+                    serde_json::Value::Object(object) => {
+                        object.get("code").and_then(serde_json::Value::as_str)
+                    }
+                    _ => None,
+                })
+                .or_else(|| value.get("code").and_then(serde_json::Value::as_str))
+                .map(str::to_ascii_lowercase)
+        });
+    let known_terminal = matches!(
+        code.as_deref(),
+        Some("refresh_token_expired" | "refresh_token_reused" | "refresh_token_invalidated")
+    );
+    if known_terminal
+        || status == reqwest::StatusCode::BAD_REQUEST
+        || status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+    {
+        return Status::failed_precondition(
+            "OpenAI Codex subscription authorization requires sign-in",
+        );
+    }
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT {
+        return Status::deadline_exceeded("OpenAI Codex token refresh timed out");
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Status::resource_exhausted("OpenAI Codex token refresh was rate limited");
+    }
+    Status::unavailable(format!(
+        "OpenAI Codex token refresh temporarily failed (HTTP {})",
+        status.as_u16()
+    ))
+}
+
+async fn bounded_codex_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, Status> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_OPENAI_CODEX_OAUTH_RESPONSE_BYTES as u64)
+    {
+        return Err(Status::unavailable(
+            "OpenAI Codex token response exceeded the size limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| Status::unavailable("OpenAI Codex token refresh response failed"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_OPENAI_CODEX_OAUTH_RESPONSE_BYTES {
+            return Err(Status::unavailable(
+                "OpenAI Codex token response exceeded the size limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn mint_openai_codex_oauth(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<MintedCredential, Status> {
+    let refresh_token = required_material(&state.material, "refresh_token")?;
+    let expected_account_id = required_material(&state.material, "account_id")?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| Status::internal("build OpenAI Codex OAuth client failed"))?;
+    let response = client
+        .post(codex_auth_endpoint(state, false))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({
+            "client_id": OPENAI_CODEX_OAUTH_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }))
+        .header("originator", "openshell")
+        .send()
+        .await
+        .map_err(|_| Status::unavailable("OpenAI Codex token refresh request failed"))?;
+    let status = response.status();
+    let body = bounded_codex_response_body(response).await?;
+    if !status.is_success() {
+        return Err(codex_refresh_failure(status, &body));
+    }
+    let token: OpenAiCodexRefreshResponse = serde_json::from_slice(&body).map_err(|_| {
+        Status::failed_precondition("OpenAI Codex token endpoint returned invalid JSON")
+    })?;
+    let access_token = token
+        .access_token
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition("OpenAI Codex token endpoint returned no access token")
+        })?;
+    let expires_at_ms = jwt_expiry_ms(&access_token)?;
+    let mut material_updates = HashMap::new();
+    if let Some(id_token) = token.id_token.filter(|value| !value.trim().is_empty()) {
+        let (account_id, is_fedramp) = codex_account_claims(&id_token)?;
+        if account_id != expected_account_id {
+            return Err(Status::failed_precondition(
+                "OpenAI Codex refreshed a different account; sign in again",
+            ));
+        }
+        material_updates.insert("account_id".to_string(), account_id);
+        material_updates.insert("fedramp".to_string(), is_fedramp.to_string());
+    }
+    Ok(MintedCredential {
+        access_token,
+        expires_at_ms,
+        refresh_token: token.refresh_token.filter(|value| !value.trim().is_empty()),
+        additional_credentials: HashMap::new(),
+        material_updates,
+    })
+}
+
+pub async fn revoke_openai_codex_oauth(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<(), Status> {
+    if ProviderCredentialRefreshStrategy::try_from(state.strategy)
+        != Ok(ProviderCredentialRefreshStrategy::OpenaiCodexOauth)
+    {
+        return Err(Status::invalid_argument(
+            "remote revocation is supported only for openai_codex_oauth",
+        ));
+    }
+    let refresh_token = required_material(&state.material, "refresh_token")?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| Status::internal("build OpenAI Codex revoke client failed"))?;
+    let response = client
+        .post(codex_auth_endpoint(state, true))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({
+            "client_id": OPENAI_CODEX_OAUTH_CLIENT_ID,
+            "token": refresh_token,
+            "token_type_hint": "refresh_token",
+        }))
+        .header("originator", "openshell")
+        .send()
+        .await
+        .map_err(|_| Status::unavailable("OpenAI Codex revoke request failed"))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    if status == reqwest::StatusCode::BAD_REQUEST
+        || status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+    {
+        return Err(Status::failed_precondition(
+            "OpenAI Codex revoke request was rejected",
+        ));
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(Status::resource_exhausted(
+            "OpenAI Codex revoke request was rate limited",
+        ));
+    }
+    Err(Status::unavailable(format!(
+        "OpenAI Codex revoke temporarily failed (HTTP {})",
+        status.as_u16()
+    )))
 }
 
 async fn mint_google_service_account_jwt(
@@ -944,6 +1285,7 @@ async fn mint_aws_sts_assume_role(
         expires_at_ms,
         refresh_token: None,
         additional_credentials: additional,
+        material_updates: HashMap::new(),
     })
 }
 
@@ -1007,6 +1349,7 @@ async fn request_token(
             .refresh_token
             .filter(|refresh_token| !refresh_token.trim().is_empty()),
         additional_credentials: HashMap::new(),
+        material_updates: HashMap::new(),
     })
 }
 
@@ -1115,8 +1458,12 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) =
-                run_refresh_worker_tick(state.store.as_ref(), Some(&state.credentials)).await
+            if let Err(err) = run_refresh_worker_tick(
+                &state.provider_refresh_mutex,
+                state.store.as_ref(),
+                Some(&state.credentials),
+            )
+            .await
             {
                 warn!(error = %err, "provider credential refresh worker tick failed");
             }
@@ -1134,6 +1481,7 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
     )
 )]
 async fn run_refresh_worker_tick(
+    operation_mutex: &tokio::sync::Mutex<()>,
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
 ) -> Result<(), Status> {
@@ -1150,18 +1498,26 @@ async fn run_refresh_worker_tick(
         .iter()
         .filter(|state| state.status == "rotation_requested")
         .count();
+    let incomplete_publish_count = states
+        .iter()
+        .filter(|state| state.status == "publishing")
+        .count();
     let span = tracing::Span::current();
     span.record("watched_count", watched_count);
     span.record("due_count", due_count);
     info!(
         watched_count,
-        due_count, rotation_requested_count, "provider credential refresh worker sweep"
+        due_count,
+        rotation_requested_count,
+        incomplete_publish_count,
+        "provider credential refresh worker sweep"
     );
     for state in states {
         let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
             .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
         let due = state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms;
         let rotation_requested = state.status == "rotation_requested";
+        let incomplete_publish = state.status == "publishing";
         info!(
             provider = %state.provider_name,
             credential_key = %state.credential_key,
@@ -1174,9 +1530,10 @@ async fn run_refresh_worker_tick(
             seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
             due,
             rotation_requested,
+            incomplete_publish,
             "provider credential refresh watch"
         );
-        if !due && !rotation_requested {
+        if !due && !rotation_requested && !incomplete_publish {
             continue;
         }
         if !is_gateway_mintable_strategy(strategy) {
@@ -1197,6 +1554,7 @@ async fn run_refresh_worker_tick(
             "refreshing provider credential"
         );
         if let Err(err) = refresh_provider_credential(
+            operation_mutex,
             store,
             state.object_workspace(),
             credentials,
@@ -1222,9 +1580,10 @@ async fn run_refresh_worker_tick(
 #[cfg(test)]
 mod tests {
     use super::{
-        NewRefreshStateConfig, delete_refresh_state, get_refresh_state, new_refresh_state,
-        put_refresh_state, refresh_provider_credential, refresh_state_name, refresh_strategy_name,
-        run_refresh_worker_tick, seconds_until_ms,
+        NewRefreshStateConfig, delete_refresh_state, get_refresh_state, mint_openai_codex_oauth,
+        new_refresh_state, put_refresh_state,
+        refresh_provider_credential_inner as refresh_provider_credential, refresh_state_name,
+        refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
@@ -1235,7 +1594,7 @@ mod tests {
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_json, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -1278,6 +1637,403 @@ mod tests {
             "google_service_account_jwt"
         );
         assert_eq!(refresh_strategy_name(i32::MAX), "unspecified");
+    }
+
+    fn test_jwt(payload: serde_json::Value) -> String {
+        use base64::Engine as _;
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        format!("header.{payload}.signature")
+    }
+
+    fn codex_refresh_state(
+        provider: &Provider,
+        auth_base_url: &str,
+        account_id: &str,
+    ) -> openshell_core::proto::StoredProviderCredentialRefreshState {
+        new_refresh_state(
+            provider,
+            "default",
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+                material: HashMap::from([
+                    ("refresh_token".to_string(), "old-refresh-token".to_string()),
+                    ("account_id".to_string(), account_id.to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                    ("test_auth_base_url".to_string(), auth_base_url.to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms: 0,
+                token_url: super::OPENAI_CODEX_OAUTH_TOKEN_URL.to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .expect("Codex refresh state")
+    }
+
+    #[tokio::test]
+    async fn openai_codex_refresh_rotates_and_persists_gateway_only_material() {
+        let mock_server = MockServer::start().await;
+        let expires = current_time_ms() / 1000 + 3600;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(header("originator", "openshell"))
+            .and(body_json(serde_json::json!({
+                "client_id": super::OPENAI_CODEX_OAUTH_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": "old-refresh-token"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": test_jwt(serde_json::json!({"exp": expires})),
+                "refresh_token": "rotated-refresh-token",
+                "id_token": test_jwt(serde_json::json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "account-123",
+                        "chatgpt_account_is_fedramp": true
+                    }
+                }))
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let provider = provider("codex-subscription", "openai-codex-oauth");
+        store.put_message(&provider).await.unwrap();
+        let state = codex_refresh_state(&provider, &mock_server.uri(), "account-123");
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "codex-subscription",
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .expect("Codex credential should refresh");
+        assert_eq!(refreshed.status, "refreshed");
+        assert_eq!(refreshed.material["refresh_token"], "rotated-refresh-token");
+        assert_eq!(refreshed.material["account_id"], "account-123");
+        assert_eq!(refreshed.material["fedramp"], "true");
+        assert!(refreshed.expires_at_ms > current_time_ms());
+
+        let stored = store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.credentials[super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY],
+            test_jwt(serde_json::json!({"exp": expires}))
+        );
+        assert_eq!(
+            stored.credential_expires_at_ms[super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY],
+            refreshed.expires_at_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_worker_recovers_an_incomplete_codex_publish_before_its_deadline() {
+        let mock_server = MockServer::start().await;
+        let expires = current_time_ms() / 1000 + 3600;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": test_jwt(serde_json::json!({"exp": expires})),
+                "refresh_token": "recovered-refresh-token",
+                "id_token": test_jwt(serde_json::json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "account-123",
+                        "chatgpt_account_is_fedramp": false
+                    }
+                }))
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        crate::grpc::policy::set_global_bool_setting_for_test(
+            &store,
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+        let provider = provider("codex-subscription", "openai-codex-oauth");
+        store.put_message(&provider).await.unwrap();
+        let mut state = codex_refresh_state(&provider, &mock_server.uri(), "account-123");
+        state.status = "publishing".to_string();
+        state.next_refresh_at_ms = current_time_ms() + 3_600_000;
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let operation_mutex = tokio::sync::Mutex::new(());
+        run_refresh_worker_tick(&operation_mutex, &store, None)
+            .await
+            .unwrap();
+
+        let refreshed = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+        assert_eq!(
+            refreshed.material["refresh_token"],
+            "recovered-refresh-token"
+        );
+        let stored = store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .credentials
+                .contains_key(super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY)
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_codex_refresh_classifies_failures_without_echoing_response_secrets() {
+        for (status, error_code, expected_code) in [
+            (408, "timeout-canary", tonic::Code::DeadlineExceeded),
+            (429, "rate-canary", tonic::Code::ResourceExhausted),
+            (500, "server-canary", tonic::Code::Unavailable),
+            (
+                400,
+                "refresh_token_invalidated",
+                tonic::Code::FailedPrecondition,
+            ),
+        ] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "error": {"code": error_code},
+                        "detail": "response-secret-canary"
+                    })),
+                )
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+            let provider = provider("codex-subscription", "openai-codex-oauth");
+            let state = codex_refresh_state(&provider, &mock_server.uri(), "account-123");
+
+            let error = mint_openai_codex_oauth(&state)
+                .await
+                .expect_err("refresh should fail");
+            assert_eq!(error.code(), expected_code);
+            assert!(!error.message().contains("response-secret-canary"));
+            assert!(!error.message().contains(error_code));
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_codex_refresh_rejects_oversized_response_without_echoing_it() {
+        let mock_server = MockServer::start().await;
+        let canary = format!(
+            "oversized-response-secret-canary{}",
+            "x".repeat(super::MAX_OPENAI_CODEX_OAUTH_RESPONSE_BYTES)
+        );
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(canary.clone()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let provider = provider("codex-subscription", "openai-codex-oauth");
+        let state = codex_refresh_state(&provider, &mock_server.uri(), "account-123");
+
+        let error = mint_openai_codex_oauth(&state)
+            .await
+            .expect_err("oversized token response must fail");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("size limit"));
+        assert!(!error.message().contains("oversized-response-secret-canary"));
+    }
+
+    #[tokio::test]
+    async fn terminal_openai_codex_refresh_persists_reauth_required_without_retry() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {"code": "refresh_token_reused"},
+                "detail": "response-secret-canary"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let store = test_store().await;
+        let provider = provider("codex-subscription", "openai-codex-oauth");
+        store.put_message(&provider).await.unwrap();
+        let state = codex_refresh_state(&provider, &mock_server.uri(), "account-123");
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let error = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "codex-subscription",
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .expect_err("terminal grant rejection must fail");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        let stored = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.status, "reauth_required");
+        assert_eq!(stored.next_refresh_at_ms, 0);
+        assert!(!stored.last_error.contains("response-secret-canary"));
+        assert!(!stored.last_error.contains("refresh_token_reused"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn openai_codex_rotation_cannot_publish_after_revocation_claims_generation() {
+        let mock_server = MockServer::start().await;
+        let (hit_tx, hit_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let expires = current_time_ms() / 1000 + 3600;
+        let body = serde_json::json!({
+            "access_token": test_jwt(serde_json::json!({"exp": expires})),
+            "refresh_token": "rotated-refresh-token",
+            "id_token": test_jwt(serde_json::json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "account-123",
+                    "chatgpt_account_is_fedramp": false
+                }
+            }))
+        })
+        .to_string();
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(GatedStsResponder {
+                hit: std::sync::Mutex::new(Some(hit_tx)),
+                release: std::sync::Mutex::new(release_rx),
+                body,
+            })
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        crate::grpc::policy::set_global_bool_setting_for_test(
+            &store,
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+        let provider = provider("codex-subscription", "openai-codex-oauth");
+        store.put_message(&provider).await.unwrap();
+        let state = codex_refresh_state(&provider, &mock_server.uri(), "account-123");
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let rotate = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "codex-subscription",
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        );
+        let claim_revocation = async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), hit_rx)
+                .await
+                .expect("refresh should reach token endpoint")
+                .expect("refresh hit sender should remain available");
+            let mut current = get_refresh_state(
+                &store,
+                "default",
+                provider.object_id(),
+                super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let expected_version = current.metadata.as_ref().unwrap().resource_version;
+            current.status = "revoking".to_string();
+            current.next_refresh_at_ms = 0;
+            super::persist_refresh_state_if_current(&store, &current, expected_version)
+                .await
+                .unwrap()
+                .expect("revocation must claim refresh generation");
+            release_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(rotate, claim_revocation);
+
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Aborted);
+        let current = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(current.status, "revoking");
+        assert_eq!(current.material["refresh_token"], "old-refresh-token");
+        let stored = store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored
+                .credentials
+                .contains_key(super::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY)
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_codex_refresh_rejects_account_switch() {
+        let mock_server = MockServer::start().await;
+        let expires = current_time_ms() / 1000 + 3600;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": test_jwt(serde_json::json!({"exp": expires})),
+                "id_token": test_jwt(serde_json::json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "different-account",
+                        "chatgpt_account_is_fedramp": false
+                    }
+                }))
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let provider = provider("codex-subscription", "openai-codex-oauth");
+        let state = codex_refresh_state(&provider, &mock_server.uri(), "account-123");
+
+        let error = mint_openai_codex_oauth(&state)
+            .await
+            .expect_err("account switch must fail closed");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(!error.message().contains("different-account"));
+        assert!(!error.message().contains("account-123"));
     }
 
     #[tokio::test]
@@ -1715,7 +2471,10 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        run_refresh_worker_tick(&store, None).await.unwrap();
+        let operation_mutex = tokio::sync::Mutex::new(());
+        run_refresh_worker_tick(&operation_mutex, &store, None)
+            .await
+            .unwrap();
 
         let stored_state = get_refresh_state(
             &store,
@@ -1751,7 +2510,10 @@ mod tests {
         let store = test_store().await;
 
         let traced = test_exporter::install_traced();
-        run_refresh_worker_tick(&store, None).await.unwrap();
+        let operation_mutex = tokio::sync::Mutex::new(());
+        run_refresh_worker_tick(&operation_mutex, &store, None)
+            .await
+            .unwrap();
 
         let spans = traced.finished_spans();
         let root = spans
@@ -2086,6 +2848,7 @@ mod tests {
                     "FwoGZXIvYXdzEBYaDH...EXAMPLETOKEN".to_string(),
                 ),
             ]),
+            material_updates: HashMap::new(),
         };
 
         apply_minted_credential(&store, "default", None, &prov, "AWS_ACCESS_KEY_ID", &minted)
@@ -2157,6 +2920,7 @@ mod tests {
             expires_at_ms: 4_000_000_000_000,
             refresh_token: None,
             additional_credentials: HashMap::new(),
+            material_updates: HashMap::new(),
         };
 
         apply_minted_credential(
@@ -2256,6 +3020,7 @@ mod tests {
                 ),
                 ("AWS_SESSION_TOKEN".to_string(), "session-token".to_string()),
             ]),
+            material_updates: HashMap::new(),
         };
         let credentials = CredentialRuntime::from_config(
             &Config::new(None).with_credential_drivers(["test-static"]),

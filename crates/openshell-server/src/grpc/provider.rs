@@ -1969,9 +1969,17 @@ fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) 
 }
 
 fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
-    openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
-        == Some("google-vertex-ai")
-        && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
+    matches!(
+        (
+            openshell_core::inference::normalize_inference_provider_type(&provider.r#type),
+            key,
+        ),
+        (Some("google-vertex-ai"), "GOOGLE_SERVICE_ACCOUNT_KEY")
+            | (
+                Some("openai-codex-oauth"),
+                crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            )
+    )
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
@@ -2076,6 +2084,16 @@ pub(super) async fn handle_create_provider(
     };
     if let Some(metadata) = provider.metadata.as_mut() {
         metadata.workspace.clone_from(&workspace);
+    }
+    if normalize_provider_type(&provider.r#type) == Some("openai-codex-oauth")
+        && (!provider.credentials.is_empty()
+            || !provider.credential_handles.is_empty()
+            || !provider.credential_expires_at_ms.is_empty()
+            || !provider.config.is_empty())
+    {
+        return Err(Status::invalid_argument(
+            "OpenAI Codex subscription providers must be created empty and activated with provider login",
+        ));
     }
     let provider_type = provider.r#type.clone();
     let catalog = state
@@ -2645,6 +2663,28 @@ fn validate_strategy_profile_binding(
     refresh_defaults: Option<&CredentialRefreshProfile>,
     additional_output_keys: &HashMap<String, String>,
 ) -> Result<(), Status> {
+    if strategy == ProviderCredentialRefreshStrategy::OpenaiCodexOauth {
+        let refresh_defaults = refresh_defaults.ok_or_else(|| {
+            Status::failed_precondition(
+                "openai_codex_oauth requires the reviewed openai-codex-oauth provider profile",
+            )
+        })?;
+        if credential_key != crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY {
+            return Err(Status::failed_precondition(format!(
+                "openai_codex_oauth requires credential_key {}",
+                crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+            )));
+        }
+        if refresh_defaults.strategy != strategy
+            || refresh_defaults.token_url != "https://auth.openai.com/oauth/token"
+            || !additional_output_keys.is_empty()
+        {
+            return Err(Status::failed_precondition(
+                "openai_codex_oauth provider profile does not match the reviewed pinned contract",
+            ));
+        }
+        return Ok(());
+    }
     let Some(expected_primary) = strategy_primary_env_key(strategy) else {
         return Ok(());
     };
@@ -2673,6 +2713,45 @@ fn validate_strategy_profile_binding(
                 "strategy '{strategy_name}' requires profile additional output '{output}' bound to {expected_env}"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_openai_codex_material(
+    material: &HashMap<String, String>,
+    secret_material_keys: &[String],
+) -> Result<(), Status> {
+    for key in material.keys() {
+        if !matches!(key.as_str(), "refresh_token" | "account_id" | "fedramp") {
+            return Err(Status::invalid_argument(format!(
+                "openai_codex_oauth does not accept material key '{key}'"
+            )));
+        }
+    }
+    for key in secret_material_keys {
+        if !matches!(key.as_str(), "refresh_token" | "account_id" | "fedramp") {
+            return Err(Status::invalid_argument(format!(
+                "openai_codex_oauth does not accept secret material key '{key}'"
+            )));
+        }
+    }
+    if let Some(account_id) = material.get("account_id") {
+        let account_id = account_id.trim();
+        if account_id.is_empty()
+            || account_id.len() > 512
+            || account_id.parse::<reqwest::header::HeaderValue>().is_err()
+        {
+            return Err(Status::invalid_argument(
+                "openai_codex_oauth account_id is not a valid routing header value",
+            ));
+        }
+    }
+    if let Some(fedramp) = material.get("fedramp")
+        && !matches!(fedramp.as_str(), "true" | "false")
+    {
+        return Err(Status::invalid_argument(
+            "openai_codex_oauth fedramp must be 'true' or 'false'",
+        ));
     }
     Ok(())
 }
@@ -3229,10 +3308,40 @@ pub(super) async fn handle_update_provider(
         );
         return Err(Status::invalid_argument("provider is required"));
     };
+    let existing_provider_type = if let Some(name) = provider
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.name.trim())
+        .filter(|name| !name.is_empty())
+    {
+        state
+            .store
+            .get_message_by_name::<Provider>(&workspace, name)
+            .await
+            .map_err(|error| Status::internal(format!("fetch provider failed: {error}")))?
+            .map(|existing| existing.r#type)
+    } else {
+        None
+    };
+    let is_codex_provider = normalize_provider_type(&provider.r#type) == Some("openai-codex-oauth")
+        || existing_provider_type
+            .as_deref()
+            .and_then(normalize_provider_type)
+            == Some("openai-codex-oauth");
     let provider_type = provider.r#type.clone();
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
+    if is_codex_provider
+        && (!provider.credentials.is_empty()
+            || !provider.credential_handles.is_empty()
+            || !provider.credential_expires_at_ms.is_empty()
+            || !provider.config.is_empty())
+    {
+        return Err(Status::invalid_argument(
+            "OpenAI Codex subscription credentials and routing metadata are gateway-managed; use provider login or logout",
+        ));
+    }
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3325,7 +3434,7 @@ pub(super) async fn handle_configure_provider_refresh(
     request: Request<ConfigureProviderRefreshRequest>,
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
     let principal = super::extract_principal(&request)?;
-    let request = request.into_inner();
+    let mut request = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
@@ -3360,6 +3469,19 @@ pub(super) async fn handle_configure_provider_refresh(
             "refresh strategy '{}' is not gateway-mintable; update current credentials with provider update instead",
             crate::provider_refresh::refresh_strategy_name(strategy as i32)
         )));
+    }
+    if strategy == ProviderCredentialRefreshStrategy::OpenaiCodexOauth {
+        validate_openai_codex_material(&request.material, &request.secret_material_keys)?;
+        for key in ["refresh_token", "account_id", "fedramp"] {
+            if request.material.contains_key(key)
+                && !request
+                    .secret_material_keys
+                    .iter()
+                    .any(|candidate| candidate == key)
+            {
+                request.secret_material_keys.push(key.to_string());
+            }
+        }
     }
     if strategy == ProviderCredentialRefreshStrategy::AwsStsAssumeRole {
         let global_settings =
@@ -3472,6 +3594,7 @@ pub(super) async fn handle_configure_provider_refresh(
     // validation before either persisted and both reserve the same key (CWE-362).
     // This is the same guard sandbox create/attach and profile changes take.
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _refresh_operation_guard = state.provider_refresh_mutex.lock().await;
 
     let provider = state
         .store
@@ -3561,6 +3684,15 @@ pub(super) async fn handle_configure_provider_refresh(
         credential_key,
     )
     .await?;
+    if strategy == ProviderCredentialRefreshStrategy::OpenaiCodexOauth
+        && existing_refresh_state
+            .as_ref()
+            .is_some_and(|existing| existing.status != "reauth_required")
+    {
+        return Err(Status::failed_precondition(
+            "OpenAI Codex grant already exists; revoke it before replacing the refresh state",
+        ));
+    }
     let expires_at_ms = request.expires_at_ms.unwrap_or_else(|| {
         existing_refresh_state
             .as_ref()
@@ -3645,6 +3777,7 @@ pub(super) async fn handle_rotate_provider_credential(
         return Err(Status::invalid_argument("credential_key is required"));
     }
     let refresh_state = crate::provider_refresh::refresh_provider_credential(
+        &state.provider_refresh_mutex,
         state.store.as_ref(),
         &workspace,
         Some(&state.credentials),
@@ -3713,26 +3846,108 @@ pub(super) async fn handle_delete_provider_refresh(
     if credential_key.is_empty() {
         return Err(Status::invalid_argument("credential_key is required"));
     }
+    // Serialize revocation against configure/attach changes and every remote
+    // refresh. The refresh-state transition to `revoking` below remains the
+    // durable CAS fence; this process-local guard additionally prevents a
+    // rotated remote grant from being minted after its predecessor is revoked.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _refresh_operation_guard = state.provider_refresh_mutex.lock().await;
     let provider = state
         .store
         .get_message_by_name::<Provider>(&workspace, provider_name)
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
-    let existing_refresh_state = crate::provider_refresh::get_refresh_state(
+    let mut existing_refresh_state = crate::provider_refresh::get_refresh_state(
         state.store.as_ref(),
         &workspace,
         provider.object_id(),
         credential_key,
     )
     .await?;
-    let deleted_refresh_state = crate::provider_refresh::delete_refresh_state(
-        state.store.as_ref(),
-        &workspace,
-        provider.object_id(),
-        credential_key,
-    )
-    .await?;
+    let expected_refresh_generation_id = request.expected_refresh_generation_id.trim();
+    if !expected_refresh_generation_id.is_empty() {
+        let current_refresh_generation_id = existing_refresh_state
+            .as_ref()
+            .map(|refresh_state| refresh_state.refresh_generation_id.as_str())
+            .unwrap_or_default();
+        if current_refresh_generation_id != expected_refresh_generation_id {
+            return Err(Status::aborted(
+                "provider refresh generation changed; refusing stale cleanup",
+            ));
+        }
+    }
+    if existing_refresh_state
+        .as_ref()
+        .is_some_and(|refresh_state| {
+            ProviderCredentialRefreshStrategy::try_from(refresh_state.strategy)
+                == Ok(ProviderCredentialRefreshStrategy::OpenaiCodexOauth)
+        })
+        && (!request.revoke_remote || !request.clear_credential)
+    {
+        return Err(Status::failed_precondition(
+            "OpenAI Codex logout requires remote revocation and local credential clearing; use provider logout",
+        ));
+    }
+    let remote_revoked = if request.revoke_remote {
+        let refresh_state = existing_refresh_state
+            .as_mut()
+            .ok_or_else(|| Status::failed_precondition("provider has no OAuth grant to revoke"))?;
+        if ProviderCredentialRefreshStrategy::try_from(refresh_state.strategy)
+            != Ok(ProviderCredentialRefreshStrategy::OpenaiCodexOauth)
+        {
+            return Err(Status::invalid_argument(
+                "remote revocation is supported only for openai_codex_oauth",
+            ));
+        }
+        let expected_version = refresh_state
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.resource_version);
+        refresh_state.status = "revoking".to_string();
+        refresh_state.next_refresh_at_ms = 0;
+        refresh_state.last_error.clear();
+        let Some(claimed_version) = crate::provider_refresh::persist_refresh_state_if_current(
+            state.store.as_ref(),
+            refresh_state,
+            expected_version,
+        )
+        .await?
+        else {
+            return Err(Status::aborted(
+                "provider refresh changed while revocation started; retry logout",
+            ));
+        };
+        if let Some(metadata) = refresh_state.metadata.as_mut() {
+            metadata.resource_version = claimed_version;
+        }
+        if let Err(error) = crate::provider_refresh::revoke_openai_codex_oauth(refresh_state).await
+        {
+            refresh_state.status = "revoke_failed".to_string();
+            refresh_state.last_error = error.message().to_string();
+            let _ = crate::provider_refresh::persist_refresh_state_if_current(
+                state.store.as_ref(),
+                refresh_state,
+                claimed_version,
+            )
+            .await?;
+            return Err(error);
+        }
+        true
+    } else {
+        false
+    };
+    let deleted_before_cleanup = if request.revoke_remote {
+        false
+    } else {
+        crate::provider_refresh::delete_refresh_state(
+            state.store.as_ref(),
+            &workspace,
+            provider.object_id(),
+            credential_key,
+        )
+        .await?
+    };
 
     // A refresh co-manages the expiry of its primary credential and every pinned
     // additional output. Clear each expiry this refresh still owns, leaving
@@ -3740,12 +3955,12 @@ pub(super) async fn handle_delete_provider_refresh(
     // inside the CAS closure so they see the current stored provider — deciding
     // from the snapshot read above would let a concurrent rotation or provider
     // update land between the read and the write and then be clobbered (CWE-362).
-    if let Some(refresh_state) = existing_refresh_state
+    if let Some(refresh_state) = existing_refresh_state.as_ref()
         && refresh_state.expires_at_ms > 0
     {
         let refresh_expires_at_ms = refresh_state.expires_at_ms;
         let owned_keys: Vec<String> = std::iter::once(credential_key.to_string())
-            .chain(refresh_state.additional_output_keys.into_values())
+            .chain(refresh_state.additional_output_keys.values().cloned())
             .collect();
         state
             .store
@@ -3760,8 +3975,58 @@ pub(super) async fn handle_delete_provider_refresh(
             })?;
     }
 
+    let credential_cleared = if request.clear_credential {
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), &workspace)
+            .await?;
+        let update = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: provider_name.to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: String::new(),
+                deletion_timestamp_ms: 0,
+            }),
+            r#type: String::new(),
+            credentials: HashMap::from([(credential_key.to_string(), String::new())]),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::from([(credential_key.to_string(), 0)]),
+            profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
+        };
+        update_provider_record_validating(
+            state.store.as_ref(),
+            &workspace,
+            &catalog,
+            update,
+            Some(&state.credentials),
+        )
+        .await?;
+        true
+    } else {
+        false
+    };
+
+    let deleted_refresh_state = if request.revoke_remote {
+        crate::provider_refresh::delete_refresh_state(
+            state.store.as_ref(),
+            &workspace,
+            provider.object_id(),
+            credential_key,
+        )
+        .await?
+    } else {
+        deleted_before_cleanup
+    };
+
     Ok(Response::new(DeleteProviderRefreshResponse {
         deleted: deleted_refresh_state,
+        remote_revoked,
+        credential_cleared,
     }))
 }
 
@@ -3783,6 +4048,27 @@ pub(super) async fn handle_delete_provider(
         .await?
         .name;
     let name = req.name;
+    // Serialize the Codex grant check with refresh configuration, logout, and
+    // sandbox attachment changes. A generic provider delete must not erase the
+    // only gateway copy of a still-live remote grant before it is revoked.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    if let Some(provider) = state
+        .store
+        .get_message_by_name::<Provider>(&workspace, &name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+        && normalize_provider_type(&provider.r#type) == Some("openai-codex-oauth")
+        && !crate::provider_refresh::list_refresh_states_for_provider(
+            state.store.as_ref(),
+            provider.object_id(),
+        )
+        .await?
+        .is_empty()
+    {
+        return Err(Status::failed_precondition(format!(
+            "provider '{name}' still owns an OpenAI Codex grant; run 'openshell provider logout --name {name}' before deleting it"
+        )));
+    }
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &workspace, &name).await;
     let result = delete_provider_record_with_credentials(
         state.store.as_ref(),
@@ -3885,6 +4171,25 @@ mod tests {
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+    struct FailOnceThenSucceed {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Respond for FailOnceThenSucceed {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                ResponseTemplate::new(500).set_body_string("response-secret-canary")
+            } else {
+                ResponseTemplate::new(200)
+            }
+        }
+    }
 
     #[test]
     fn env_key_validation_accepts_valid_keys() {
@@ -4568,6 +4873,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn codex_subscription_access_token_is_never_sandbox_injectable() {
+        let mut provider = provider_with_values("codex-subscription", "openai-codex-oauth");
+        provider.config.clear();
+        provider.credentials = HashMap::from([(
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY.to_string(),
+            "access-token-canary".to_string(),
+        )]);
+        assert!(is_non_injectable_provider_credential(
+            &provider,
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+        ));
+        assert!(
+            active_provider_credential_keys(&provider, crate::persistence::current_time_ms())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn openai_codex_material_accepts_only_pinned_header_safe_shape() {
+        let valid = HashMap::from([
+            ("refresh_token".to_string(), "refresh-token".to_string()),
+            ("account_id".to_string(), "account-123".to_string()),
+            ("fedramp".to_string(), "false".to_string()),
+        ]);
+        validate_openai_codex_material(&valid, &[]).unwrap();
+
+        for (key, value) in [
+            ("fedramp", "yes"),
+            ("account_id", "account-123\r\nx-injected: true"),
+            ("test_auth_base_url", "https://attacker.invalid"),
+        ] {
+            let mut invalid = valid.clone();
+            invalid.insert(key.to_string(), value.to_string());
+            assert!(
+                validate_openai_codex_material(&invalid, &[]).is_err(),
+                "{key} must fail the reviewed material contract"
+            );
+        }
+        assert!(
+            validate_openai_codex_material(&valid, &["unexpected".to_string()]).is_err(),
+            "unknown secret keys must fail the reviewed material contract"
+        );
+    }
+
     fn provider_with_credential_handle(
         name: &str,
         provider_type: &str,
@@ -4785,6 +5135,7 @@ mod tests {
                 "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
+                "openai-codex-oauth",
                 "pypi"
             ]
         );
@@ -5568,6 +5919,9 @@ mod tests {
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 workspace: "default".to_string(),
+                revoke_remote: false,
+                clear_credential: false,
+                expected_refresh_generation_id: String::new(),
             }),
         )
         .await
@@ -5599,6 +5953,508 @@ mod tests {
                 .credential_expires_at_ms
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
         );
+    }
+
+    #[tokio::test]
+    async fn codex_logout_fails_closed_then_retries_revocation_before_local_cleanup() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/revoke"))
+            .and(header("originator", "openshell"))
+            .and(body_json(serde_json::json!({
+                "client_id": crate::provider_refresh::OPENAI_CODEX_OAUTH_CLIENT_ID,
+                "token": "refresh-token-canary",
+                "token_type_hint": "refresh_token"
+            })))
+            .respond_with(FailOnceThenSucceed {
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let state = test_server_state().await;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+        let mut provider = provider_with_values("codex-subscription", "openai-codex-oauth");
+        provider.config.clear();
+        provider.credentials = HashMap::from([(
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY.to_string(),
+            "access-token-canary".to_string(),
+        )]);
+        provider.credential_expires_at_ms = HashMap::from([(
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY.to_string(),
+            expires_at_ms,
+        )]);
+        create_provider_record(state.store.as_ref(), "default", provider)
+            .await
+            .unwrap();
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut refresh = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "default",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+                material: HashMap::from([
+                    (
+                        "refresh_token".to_string(),
+                        "refresh-token-canary".to_string(),
+                    ),
+                    ("account_id".to_string(), "account-route-123".to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                    ("test_auth_base_url".to_string(), mock_server.uri()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms,
+                token_url: crate::provider_refresh::OPENAI_CODEX_OAUTH_TOKEN_URL.to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .unwrap();
+        refresh.status = "refreshed".to_string();
+        let refresh_generation_id = refresh.refresh_generation_id.clone();
+        assert!(!refresh_generation_id.is_empty());
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &refresh)
+            .await
+            .unwrap();
+
+        crate::grpc::policy::set_global_bool_setting_for_test(
+            state.store.as_ref(),
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+        let replace_error = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth as i32,
+                material: HashMap::from([
+                    ("refresh_token".to_string(), "replacement-grant".to_string()),
+                    ("account_id".to_string(), "account-route-123".to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("an active Codex grant must not be overwritten");
+        assert_eq!(replace_error.code(), Code::FailedPrecondition);
+        assert!(
+            replace_error
+                .message()
+                .contains("revoke it before replacing")
+        );
+
+        let bypass_error = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: false,
+                clear_credential: false,
+                expected_refresh_generation_id: String::new(),
+            }),
+        )
+        .await
+        .expect_err("Codex state deletion must not bypass remote revocation");
+        assert_eq!(bypass_error.code(), Code::FailedPrecondition);
+        assert!(bypass_error.message().contains("provider logout"));
+
+        let retained_credential_error = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: true,
+                clear_credential: false,
+                expected_refresh_generation_id: refresh_generation_id.clone(),
+            }),
+        )
+        .await
+        .expect_err("Codex logout must not retain a cached access token");
+        assert_eq!(retained_credential_error.code(), Code::FailedPrecondition);
+        assert!(
+            retained_credential_error
+                .message()
+                .contains("credential clearing")
+        );
+
+        let stale_cleanup_error = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: true,
+                clear_credential: true,
+                expected_refresh_generation_id: "different-grant-generation".to_string(),
+            }),
+        )
+        .await
+        .expect_err("stale cleanup must not revoke the current grant");
+        assert_eq!(stale_cleanup_error.code(), Code::Aborted);
+        assert!(
+            stale_cleanup_error
+                .message()
+                .contains("refresh generation changed")
+        );
+        let state_after_stale_cleanup = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .expect("stale cleanup preserves the current refresh state");
+        assert_eq!(
+            state_after_stale_cleanup.refresh_generation_id,
+            refresh_generation_id
+        );
+
+        let first_error = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: true,
+                clear_credential: true,
+                expected_refresh_generation_id: refresh_generation_id.clone(),
+            }),
+        )
+        .await
+        .expect_err("failed remote revocation must preserve fenced local state");
+        assert_eq!(first_error.code(), Code::Unavailable);
+        assert!(!first_error.message().contains("response-secret-canary"));
+        let failed_state = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .expect("failed revocation remains retryable");
+        assert_eq!(failed_state.status, "revoke_failed");
+        let provider_after_failure = state
+            .store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            provider_after_failure.credentials
+                [crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY],
+            "access-token-canary"
+        );
+
+        let response = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: true,
+                clear_credential: true,
+                expected_refresh_generation_id: refresh_generation_id,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.deleted);
+        assert!(response.remote_revoked);
+        assert!(response.credential_cleared);
+        assert!(
+            crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                "default",
+                provider.object_id(),
+                crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !provider
+                .credentials
+                .contains_key(crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY)
+        );
+        assert!(
+            !provider
+                .credential_expires_at_ms
+                .contains_key(crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY)
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_rotation_and_logout_share_remote_operation_fence() {
+        let state = test_server_state().await;
+        let operation_guard = state.provider_refresh_mutex.lock().await;
+
+        let rotate_state = Arc::clone(&state);
+        let rotate = tokio::spawn(async move {
+            handle_rotate_provider_credential(
+                &rotate_state,
+                authed_request(RotateProviderCredentialRequest {
+                    provider: "codex-subscription".to_string(),
+                    credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                        .to_string(),
+                    workspace: "default".to_string(),
+                }),
+            )
+            .await
+        });
+
+        let logout_state = Arc::clone(&state);
+        let logout = tokio::spawn(async move {
+            handle_delete_provider_refresh(
+                &logout_state,
+                authed_request(DeleteProviderRefreshRequest {
+                    provider: "codex-subscription".to_string(),
+                    credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                        .to_string(),
+                    workspace: "default".to_string(),
+                    revoke_remote: true,
+                    clear_credential: true,
+                    expected_refresh_generation_id: String::new(),
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !rotate.is_finished(),
+            "manual rotation must wait behind the shared remote-operation fence"
+        );
+        assert!(
+            !logout.is_finished(),
+            "remote logout must wait behind the shared remote-operation fence"
+        );
+
+        rotate.abort();
+        logout.abort();
+        drop(operation_guard);
+        assert!(rotate.await.unwrap_err().is_cancelled());
+        assert!(logout.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn codex_reauthorization_rotates_the_cleanup_generation_fence() {
+        let state = test_server_state().await;
+        crate::grpc::policy::set_global_bool_setting_for_test(
+            state.store.as_ref(),
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+        let provider = create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_values("codex-reauth", "openai-codex-oauth"),
+        )
+        .await
+        .unwrap();
+        let mut old_state = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "default",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+                material: HashMap::from([
+                    ("refresh_token".to_string(), "expired-grant".to_string()),
+                    ("account_id".to_string(), "account-old".to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms: 0,
+                token_url: crate::provider_refresh::OPENAI_CODEX_OAUTH_TOKEN_URL.to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .unwrap();
+        old_state.status = "reauth_required".to_string();
+        let old_metadata_id = old_state.metadata.as_ref().unwrap().id.clone();
+        let old_generation_id = old_state.refresh_generation_id.clone();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &old_state)
+            .await
+            .unwrap();
+
+        let response = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "codex-reauth".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth as i32,
+                material: HashMap::from([
+                    ("refresh_token".to_string(), "replacement-grant".to_string()),
+                    ("account_id".to_string(), "account-new".to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let status = response.status.expect("configured status");
+        assert!(!status.refresh_generation_id.is_empty());
+        assert_ne!(status.refresh_generation_id, old_generation_id);
+
+        let replacement = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .expect("replacement refresh state");
+        assert_eq!(
+            replacement.refresh_generation_id,
+            status.refresh_generation_id
+        );
+        assert_eq!(replacement.metadata.as_ref().unwrap().id, old_metadata_id);
+        assert_eq!(
+            replacement
+                .material
+                .get("refresh_token")
+                .map(String::as_str),
+            Some("replacement-grant")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_provider_delete_requires_logout_before_local_deletion() {
+        let state = test_server_state().await;
+        let provider = create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_values("codex-subscription", "openai-codex-oauth"),
+        )
+        .await
+        .unwrap();
+        let refresh_state = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "default",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+                material: HashMap::from([
+                    ("refresh_token".to_string(), "remote-grant".to_string()),
+                    ("account_id".to_string(), "account-123".to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms: 0,
+                token_url: crate::provider_refresh::OPENAI_CODEX_OAUTH_TOKEN_URL.to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+            },
+        )
+        .unwrap();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &refresh_state)
+            .await
+            .unwrap();
+
+        let error = handle_delete_provider(
+            &state,
+            authed_request(DeleteProviderRequest {
+                name: "codex-subscription".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("provider logout"));
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Provider>("default", "codex-subscription")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        crate::provider_refresh::delete_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap();
+        let deleted = handle_delete_provider(
+            &state,
+            authed_request(DeleteProviderRequest {
+                name: "codex-subscription".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(deleted.deleted);
     }
 
     async fn state_with_authoritative_profiles_over_default_grants() -> Arc<ServerState> {
@@ -5727,6 +6583,9 @@ mod tests {
                 provider: "provider-a".to_string(),
                 credential_key: "REFRESH_TOKEN".to_string(),
                 workspace: "default".to_string(),
+                revoke_remote: false,
+                clear_credential: false,
+                expected_refresh_generation_id: String::new(),
             }),
         )
         .await
@@ -5902,6 +6761,9 @@ mod tests {
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 workspace: "default".to_string(),
+                revoke_remote: false,
+                clear_credential: false,
+                expected_refresh_generation_id: String::new(),
             }),
         )
         .await
@@ -6018,6 +6880,9 @@ mod tests {
                 provider: "aws-delete".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 workspace: "default".to_string(),
+                revoke_remote: false,
+                clear_credential: false,
+                expected_refresh_generation_id: String::new(),
             }),
         )
         .await
@@ -6918,6 +7783,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_provider_create_rejects_pasted_access_tokens() {
+        let state = test_server_state().await;
+        let mut provider = provider_with_credential_value(
+            "codex-subscription",
+            "openai-codex-oauth",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            "pasted-access-token-canary",
+        );
+        provider.credential_expires_at_ms.insert(
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY.to_string(),
+            crate::persistence::current_time_ms() + 60_000,
+        );
+
+        let error = handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(provider),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("Codex providers must start through the attended grant flow");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("created empty"));
+        assert!(!error.message().contains("pasted-access-token-canary"));
+    }
+
+    #[tokio::test]
     async fn handle_create_provider_stores_inline_credentials_with_enabled_driver() {
         let mut state = test_server_state().await;
         let config = state
@@ -7009,6 +7903,40 @@ mod tests {
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("internal gateway state"));
+    }
+
+    #[tokio::test]
+    async fn codex_provider_update_rejects_direct_credential_replacement() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_values("codex-subscription", "openai-codex-oauth"),
+        )
+        .await
+        .unwrap();
+        let mut update = provider_with_credential_value(
+            "codex-subscription",
+            "",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            "replacement-access-token-canary",
+        );
+        update.r#type.clear();
+
+        let error = handle_update_provider(
+            &state,
+            authed_request(UpdateProviderRequest {
+                provider: Some(update),
+                credential_expires_at_ms: HashMap::new(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("ordinary provider update must not replace a Codex OAuth credential");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("gateway-managed"));
+        assert!(!error.message().contains("replacement-access-token-canary"));
     }
 
     #[tokio::test]

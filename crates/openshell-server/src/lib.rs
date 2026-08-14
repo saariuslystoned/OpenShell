@@ -135,6 +135,12 @@ pub struct ServerState {
     /// mutations that reads global state.
     pub settings_mutex: tokio::sync::Mutex<()>,
 
+    /// Serializes provider refresh calls that can rotate a remote credential
+    /// against reconfiguration and revocation. The persistence CAS fences local
+    /// state, while this operation fence prevents an OAuth server from issuing a
+    /// successor refresh token concurrently with logout.
+    pub provider_refresh_mutex: tokio::sync::Mutex<()>,
+
     /// Registry of active supervisor sessions and pending relay channels.
     ///
     /// Stored as `Arc` so compute drivers (e.g. the Docker driver)
@@ -253,6 +259,7 @@ impl ServerState {
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
+            provider_refresh_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,

@@ -3248,6 +3248,373 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
     }
 }
 
+const OPENAI_CODEX_OAUTH_PROVIDER_TYPE: &str = "openai-codex-oauth";
+const OPENAI_CODEX_OAUTH_CREDENTIAL_KEY: &str = "OPENAI_CODEX_OAUTH_ACCESS_TOKEN";
+
+async fn cleanup_failed_codex_login(
+    client: &mut crate::tls::GrpcClient,
+    provider_name: &str,
+    workspace: &str,
+    created_provider: bool,
+    refresh_token: &str,
+    expected_refresh_generation_id: Option<&str>,
+) -> Vec<&'static str> {
+    let mut failures = Vec::new();
+    let mut gateway_cleanup_complete = false;
+    if let Some(expected_refresh_generation_id) = expected_refresh_generation_id {
+        match client
+            .delete_provider_refresh(DeleteProviderRefreshRequest {
+                provider: provider_name.to_string(),
+                credential_key: OPENAI_CODEX_OAUTH_CREDENTIAL_KEY.to_string(),
+                workspace: workspace.to_string(),
+                revoke_remote: true,
+                clear_credential: true,
+                expected_refresh_generation_id: expected_refresh_generation_id.to_string(),
+            })
+            .await
+        {
+            Ok(response) => {
+                let response = response.into_inner();
+                if response.deleted && response.remote_revoked && response.credential_cleared {
+                    gateway_cleanup_complete = true;
+                } else {
+                    failures.push("gateway grant cleanup reconciliation");
+                }
+            }
+            Err(_) => failures.push("gateway current-grant cleanup"),
+        }
+    } else if created_provider {
+        // Configure failed before returning the refresh-state identity. Its
+        // outcome is ambiguous, so never revoke or delete gateway state by
+        // provider name alone: a concurrent login may now own that name.
+        failures.push("provider retained for identity-safe cleanup");
+    }
+
+    // Always revoke the newly attended grant as well. When the gateway already
+    // rotated it, OpenAI returns an idempotent invalid-token response; when
+    // configure failed before persistence, this is the only remote authority.
+    if crate::codex_oauth::revoke_unclaimed_grant(refresh_token)
+        .await
+        .is_err()
+    {
+        failures.push("new grant revocation");
+    }
+
+    if created_provider
+        && gateway_cleanup_complete
+        && client
+            .delete_provider(DeleteProviderRequest {
+                name: provider_name.to_string(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .is_err()
+    {
+        failures.push("provider cleanup");
+    } else if created_provider && !gateway_cleanup_complete {
+        failures.push("provider retained for retryable cleanup");
+    }
+    failures
+}
+
+/// Create or re-authorize the gateway-managed `OpenAI` Codex subscription provider.
+///
+/// This intentionally starts a new attended grant and never imports Codex CLI
+/// or desktop credentials. The refresh token crosses the CLI/gateway boundary
+/// once in a secret protobuf field, then remains gateway-managed.
+pub async fn provider_codex_login(
+    server: &str,
+    name: &str,
+    no_open: bool,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let provider_name = name.trim();
+    if provider_name.is_empty() {
+        return Err(miette!("provider name is required"));
+    }
+    let mut client = grpc_client(server, tls).await?;
+
+    let existing_provider = match client
+        .get_provider(GetProviderRequest {
+            name: provider_name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+    {
+        Ok(response) => Some(
+            response
+                .into_inner()
+                .provider
+                .ok_or_else(|| miette!("provider missing from response"))?,
+        ),
+        Err(status) if status.code() == Code::NotFound => None,
+        Err(status) => return Err(status).into_diagnostic(),
+    };
+    if let Some(provider) = &existing_provider
+        && normalize_provider_type(&provider.r#type) != Some(OPENAI_CODEX_OAUTH_PROVIDER_TYPE)
+    {
+        return Err(miette!(
+            "provider '{provider_name}' already exists with type '{}'; choose another name",
+            provider.r#type
+        ));
+    }
+
+    if existing_provider.is_some() {
+        let statuses = client
+            .get_provider_refresh_status(GetProviderRefreshStatusRequest {
+                provider: provider_name.to_string(),
+                credential_key: OPENAI_CODEX_OAUTH_CREDENTIAL_KEY.to_string(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .credentials;
+        if statuses
+            .iter()
+            .any(|status| status.status != "reauth_required")
+        {
+            return Err(miette!(
+                "provider '{provider_name}' already has a Codex grant; log out before replacing an active or indeterminate grant"
+            ));
+        }
+    }
+
+    let device = crate::codex_oauth::request_device_code().await?;
+    println!("Open this URL to sign in with ChatGPT:");
+    println!("  {}", device.verification_url);
+    println!("Enter this one-time code:");
+    println!("  {}", device.user_code.bold());
+    println!(
+        "Continue only if you started this login in OpenShell. If another person or website gave you this code, cancel."
+    );
+    let browser_suppressed = no_open
+        || std::env::var("OPENSHELL_NO_BROWSER")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    if !browser_suppressed
+        && let Err(error) = crate::auth::open_browser_url(&device.verification_url)
+    {
+        eprintln!("Could not open the browser automatically ({error}).");
+    }
+    println!("Waiting for OpenAI authorization...");
+    let grant = crate::codex_oauth::complete_device_code(device).await?;
+
+    let created_provider = if existing_provider.is_none() {
+        let create_result = client
+            .create_provider(CreateProviderRequest {
+                provider: Some(Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: provider_name.to_string(),
+                        created_at_ms: 0,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                        annotations: HashMap::new(),
+                        workspace: workspace.to_string(),
+                        deletion_timestamp_ms: 0,
+                    }),
+                    r#type: OPENAI_CODEX_OAUTH_PROVIDER_TYPE.to_string(),
+                    credentials: HashMap::new(),
+                    config: HashMap::new(),
+                    credential_expires_at_ms: HashMap::new(),
+                    profile_workspace: workspace.to_string(),
+                    credential_handles: HashMap::new(),
+                }),
+                workspace: workspace.to_string(),
+            })
+            .await;
+        if let Err(status) = create_result {
+            let cleanup_failed = crate::codex_oauth::revoke_unclaimed_grant(&grant.refresh_token)
+                .await
+                .is_err();
+            let cleanup = if cleanup_failed {
+                " The unused grant could not be revoked automatically; revoke it from your OpenAI account security settings."
+            } else {
+                " The unused grant was revoked."
+            };
+            return Err(miette!(
+                "could not create Codex subscription provider '{provider_name}': {status}.{cleanup}"
+            ));
+        }
+        true
+    } else {
+        false
+    };
+
+    let material = HashMap::from([
+        ("refresh_token".to_string(), grant.refresh_token.clone()),
+        ("account_id".to_string(), grant.account_id),
+        ("fedramp".to_string(), grant.fedramp.to_string()),
+    ]);
+    let configure_result = client
+        .configure_provider_refresh(ConfigureProviderRefreshRequest {
+            provider: provider_name.to_string(),
+            credential_key: OPENAI_CODEX_OAUTH_CREDENTIAL_KEY.to_string(),
+            strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth as i32,
+            material,
+            secret_material_keys: vec![
+                "refresh_token".to_string(),
+                "account_id".to_string(),
+                "fedramp".to_string(),
+            ],
+            expires_at_ms: None,
+            workspace: workspace.to_string(),
+        })
+        .await;
+    let configured_refresh_generation_id = match configure_result {
+        Ok(response) => response
+            .into_inner()
+            .status
+            .map(|status| status.refresh_generation_id)
+            .filter(|id| !id.is_empty()),
+        Err(status) => {
+            let cleanup = cleanup_failed_codex_login(
+                &mut client,
+                provider_name,
+                workspace,
+                created_provider,
+                &grant.refresh_token,
+                None,
+            )
+            .await;
+            let suffix = if cleanup.is_empty() {
+                " Cleanup completed.".to_string()
+            } else {
+                format!(
+                    " Cleanup was incomplete ({}). If the provider still has a grant, run 'openshell provider logout --name {provider_name}'; otherwise revoke the unused provider grant in your OpenAI account security settings before retrying.",
+                    cleanup.join(", ")
+                )
+            };
+            return Err(miette!(
+                "could not configure Codex subscription provider '{provider_name}': {status}.{suffix}"
+            ));
+        }
+    };
+    let Some(configured_refresh_generation_id) = configured_refresh_generation_id else {
+        let cleanup = cleanup_failed_codex_login(
+            &mut client,
+            provider_name,
+            workspace,
+            created_provider,
+            &grant.refresh_token,
+            None,
+        )
+        .await;
+        return Err(miette!(
+            "could not configure Codex subscription provider '{provider_name}': the gateway returned no refresh-state identity. Cleanup was conservative ({}).",
+            cleanup.join(", ")
+        ));
+    };
+
+    let rotate_result = client
+        .rotate_provider_credential(RotateProviderCredentialRequest {
+            provider: provider_name.to_string(),
+            credential_key: OPENAI_CODEX_OAUTH_CREDENTIAL_KEY.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await;
+    let rotate_failure = match rotate_result {
+        Ok(response) => match response.into_inner().status {
+            Some(status)
+                if status.last_error.is_empty()
+                    && status.status == "refreshed"
+                    && status.expires_at_ms > chrono::Utc::now().timestamp_millis() =>
+            {
+                None
+            }
+            Some(_) => Some("the gateway did not mint a usable, unexpired credential".to_string()),
+            None => Some("the gateway returned no refresh status".to_string()),
+        },
+        Err(status) => Some(status.to_string()),
+    };
+    if let Some(reason) = rotate_failure {
+        let cleanup = cleanup_failed_codex_login(
+            &mut client,
+            provider_name,
+            workspace,
+            created_provider,
+            &grant.refresh_token,
+            Some(&configured_refresh_generation_id),
+        )
+        .await;
+        let suffix = if cleanup.is_empty() {
+            " Cleanup completed.".to_string()
+        } else {
+            format!(
+                " Cleanup was incomplete ({}). If the provider still has a grant, run 'openshell provider logout --name {provider_name}'; otherwise revoke the unused provider grant in your OpenAI account security settings before retrying.",
+                cleanup.join(", ")
+            )
+        };
+        return Err(miette!(
+            "could not activate Codex subscription provider '{provider_name}': {reason}.{suffix}"
+        ));
+    }
+
+    println!(
+        "{} Signed in provider {} with a separate gateway-managed Codex subscription grant",
+        "✓".green().bold(),
+        provider_name
+    );
+    println!(
+        "Attach it to an authorized sandbox before selecting an OpenAI Codex inference model."
+    );
+    Ok(())
+}
+
+pub async fn provider_codex_logout(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let provider_name = name.trim();
+    if provider_name.is_empty() {
+        return Err(miette!("provider name is required"));
+    }
+    let mut client = grpc_client(server, tls).await?;
+    let provider = client
+        .get_provider(GetProviderRequest {
+            name: provider_name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .provider
+        .ok_or_else(|| miette!("provider missing from response"))?;
+    if normalize_provider_type(&provider.r#type) != Some(OPENAI_CODEX_OAUTH_PROVIDER_TYPE) {
+        return Err(miette!(
+            "provider '{provider_name}' is type '{}', not a Codex subscription provider",
+            provider.r#type
+        ));
+    }
+    let response = client
+        .delete_provider_refresh(DeleteProviderRefreshRequest {
+            provider: provider_name.to_string(),
+            credential_key: OPENAI_CODEX_OAUTH_CREDENTIAL_KEY.to_string(),
+            workspace: workspace.to_string(),
+            revoke_remote: true,
+            clear_credential: true,
+            expected_refresh_generation_id: String::new(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    if !(response.deleted && response.remote_revoked && response.credential_cleared) {
+        return Err(miette!(
+            "Codex logout did not complete all revoke, state-delete, and credential-clear steps"
+        ));
+    }
+    println!(
+        "{} Revoked the Codex grant and cleared the gateway credential for {}",
+        "✓".green().bold(),
+        provider_name
+    );
+    Ok(())
+}
+
 fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
     let (Ok(mut service_url), Ok(gateway_endpoint)) = (
         url::Url::parse(service_url),
@@ -4301,6 +4668,9 @@ pub async fn provider_refresh_delete(
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
             workspace: workspace.to_string(),
+            revoke_remote: false,
+            clear_credential: false,
+            expected_refresh_generation_id: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -4361,6 +4731,7 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::OpenaiCodexOauth => "openai_codex_oauth",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -7409,6 +7780,7 @@ mod tests {
             last_refresh_at_ms: 1_767_225_000_000,
             last_error: "token endpoint returned a very long error message that should be truncated for table readability"
                 .to_string(),
+            refresh_generation_id: String::new(),
         });
 
         assert!(row.contains("my-graph"));

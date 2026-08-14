@@ -35,6 +35,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/google-cloud.yaml"),
     include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
+    include_str!("../../../providers/openai-codex-oauth.yaml"),
     include_str!("../../../providers/pypi.yaml"),
 ];
 
@@ -689,6 +690,7 @@ pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy)
             | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
             | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
             | ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            | ProviderCredentialRefreshStrategy::OpenaiCodexOauth
     )
 }
 
@@ -899,6 +901,7 @@ pub fn provider_refresh_strategy_from_yaml(raw: &str) -> Option<ProviderCredenti
             Some(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
         "aws_sts_assume_role" => Some(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
+        "openai_codex_oauth" => Some(ProviderCredentialRefreshStrategy::OpenaiCodexOauth),
         _ => None,
     }
 }
@@ -914,6 +917,7 @@ pub fn provider_refresh_strategy_to_yaml(
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::OpenaiCodexOauth => "openai_codex_oauth",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -2556,7 +2560,7 @@ pub fn builtin_profiles() -> &'static [ProviderTypeProfile] {
 mod tests {
     use std::collections::HashMap;
 
-    use openshell_core::proto::ProviderProfileCategory;
+    use openshell_core::proto::{ProviderCredentialRefreshStrategy, ProviderProfileCategory};
 
     use super::{
         DiscoveryProfile, L7AllowProfile, L7QueryMatcherProfile, ProfileError, ProviderTypeProfile,
@@ -2722,6 +2726,39 @@ mod tests {
         assert!(
             profile.allows_empty_provider_credentials(),
             "Vertex profile should allow empty-create bootstrap via gateway-mintable credentials"
+        );
+    }
+
+    #[test]
+    fn codex_subscription_profile_is_gateway_only_and_runtime_resolvable() {
+        let profile = builtin_profile("openai-codex-oauth");
+        assert!(profile.inference_capable);
+        assert!(profile.endpoints.is_empty());
+        assert!(profile.binaries.is_empty());
+        assert!(profile.discovery.credentials.is_empty());
+        assert!(profile.allows_empty_provider_credentials());
+        assert_eq!(profile.credentials.len(), 1);
+        let credential = &profile.credentials[0];
+        assert_eq!(credential.name, "OPENAI_CODEX_OAUTH_ACCESS_TOKEN");
+        assert!(credential.env_vars.is_empty());
+        let refresh = credential.refresh.as_ref().expect("refresh contract");
+        assert_eq!(
+            refresh.strategy,
+            ProviderCredentialRefreshStrategy::OpenaiCodexOauth
+        );
+        assert_eq!(refresh.token_url, "https://auth.openai.com/oauth/token");
+        let material = refresh
+            .material
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.required, entry.secret))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            material,
+            vec![
+                ("refresh_token", true, true),
+                ("account_id", true, true),
+                ("fedramp", true, true),
+            ]
         );
     }
 
@@ -3753,7 +3790,7 @@ binaries:
         let refresh = access_key.refresh.as_ref().unwrap();
         assert_eq!(
             refresh.strategy,
-            openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            ProviderCredentialRefreshStrategy::AwsStsAssumeRole
         );
         assert!(
             refresh
@@ -3855,7 +3892,7 @@ binaries:
     #[test]
     fn is_gateway_mintable_strategy_includes_aws_sts() {
         assert!(super::is_gateway_mintable_strategy(
-            openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            ProviderCredentialRefreshStrategy::AwsStsAssumeRole
         ));
     }
 

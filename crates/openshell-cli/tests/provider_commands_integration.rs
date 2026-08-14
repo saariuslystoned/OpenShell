@@ -735,6 +735,7 @@ impl OpenShell for TestOpenShell {
             next_refresh_at_ms: 0,
             last_refresh_at_ms: 0,
             last_error: String::new(),
+            refresh_generation_id: "mock-refresh-generation".to_string(),
         };
         drop(providers);
         self.state
@@ -813,7 +814,11 @@ impl OpenShell for TestOpenShell {
             .await
             .remove(&(request.provider, request.credential_key))
             .is_some();
-        Ok(Response::new(DeleteProviderRefreshResponse { deleted }))
+        Ok(Response::new(DeleteProviderRefreshResponse {
+            deleted,
+            remote_revoked: false,
+            credential_cleared: false,
+        }))
     }
 
     async fn delete_provider(

@@ -1,0 +1,139 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "OpenAI Codex Subscription"
+sidebar-title: "Codex Subscription"
+description: "Use a distinct Sign in with ChatGPT grant for gateway-routed Codex subscription inference."
+keywords: "OpenAI, Codex, ChatGPT, OAuth, Subscription, Inference, Gateway"
+---
+
+<Warning>
+The `openai-codex-oauth` provider is experimental. Its authentication contract
+is pinned to the reviewed Codex device-authorization and subscription backend
+shapes and may change when OpenAI changes those interfaces.
+</Warning>
+
+The OpenAI Codex subscription provider lets an attended operator create a
+distinct **Sign in with ChatGPT** grant managed by OpenShell. It does not copy
+or reuse credentials from Codex CLI, Codex Desktop, or another OpenAI client.
+
+The flow uses the reviewed public OAuth client contract shipped by the official
+Codex client. OpenShell does not own that OAuth client registration. It creates
+and exclusively manages a separate authorization grant and stores that grant in
+the gateway.
+
+The OpenShell gateway owns the reusable refresh token and minted access token.
+An attached sandbox's untrusted agent workload receives neither token as an
+environment variable. Its trusted supervisor/router holds only the short-lived
+access token in memory so it can proxy `https://inference.local` requests to the
+pinned Codex subscription backend; the reusable refresh token remains at the
+gateway.
+
+This is different from an `openai` provider using `OPENAI_API_KEY`. API keys use
+API-platform billing; Sign in with ChatGPT uses the limits and availability of
+the selected ChatGPT subscription and workspace.
+
+## Prerequisites
+
+- An OpenAI account with Codex access through ChatGPT.
+- An attended browser session for the one-time device authorization.
+- A gateway with provider profiles enabled:
+
+```shell
+openshell settings set --global --key providers_v2_enabled --value true
+```
+
+## Sign in
+
+Start a separate authorization grant managed only by this OpenShell provider:
+
+```shell
+openshell provider login --name codex-subscription
+```
+
+The CLI opens OpenAI's device page, prints a one-time code, waits for approval,
+creates the provider, and asks the gateway to mint its first short-lived access
+token. Use `--no-open` on a remote or headless operator machine and open the
+printed URL yourself.
+
+The command never reads an existing Codex login. If a provider already has an
+active or indeterminate grant, the command refuses to replace it. Log out first
+instead of silently rotating identities.
+
+The generic provider create/update commands cannot paste or replace this
+provider's access token or routing metadata. Those values are committed only by
+the gateway's reviewed OAuth lifecycle.
+
+## Attach and route
+
+Attach the provider only to sandboxes that should use the subscription:
+
+```shell
+openshell sandbox provider attach my-sandbox codex-subscription
+```
+
+Then configure the gateway inference route with a Codex model available to the
+selected ChatGPT workspace:
+
+```shell
+openshell inference set \
+  --provider codex-subscription \
+  --model <supported-codex-model>
+```
+
+The provider contributes no direct network endpoint to the sandbox. Calls to
+OpenAI hosts remain governed by the sandbox's ordinary network policy; the
+subscription grant is usable only through `inference.local` and only while this
+exact provider is attached.
+
+## Refresh and failure behavior
+
+The gateway refreshes the access token before expiry and binds refreshed tokens
+to the same ChatGPT account/workspace identifier. It refuses an unexpected
+account switch. A terminal refresh rejection marks the grant as requiring a new
+sign-in; transient timeouts, rate limits, and server failures are retried without
+printing the upstream response body.
+
+An in-progress, refresh-failed, expired, revoked, failed-revocation, or
+reauthorization-required grant is not published as an inference route. The
+gateway publishes a refreshed grant only after its route metadata and access
+token are both committed. Router-side expiry checks also reject a stale cached
+route before each request.
+
+## Log out
+
+Revoke the provider's grant and clear its gateway credential:
+
+```shell
+openshell provider logout --name codex-subscription
+```
+
+Logout fences refresh first, calls the pinned OpenAI revocation authority, then
+clears the local credential and refresh state. If remote revocation fails, the
+grant remains locally unavailable and retryable; OpenShell does not silently
+delete the state or resume routing it.
+
+After logout, detach or delete the now-inactive provider according to your
+normal provider lifecycle. OpenShell refuses a generic `provider delete` while
+the provider still owns a Codex refresh grant, so deletion cannot silently
+orphan the remote authorization.
+
+## Security boundary
+
+- The attended CLI contacts only the pinned OpenAI authorization origin.
+- The gateway contacts only the pinned token, revocation, and Codex inference
+  origins for this provider.
+- Redirects are disabled and OAuth response bodies are bounded.
+- Refresh tokens, account routing, and FedRAMP routing metadata are stored as
+  secret refresh material.
+- The sandboxed agent workload never receives the access or refresh token,
+  account identifier, or FedRAMP routing header. The trusted router receives
+  only the short-lived route material needed to proxy an attached sandbox.
+- The router discards sandbox-supplied `ChatGPT-Account-ID`,
+  `X-OpenAI-FedRAMP`, and `originator` values before injecting the
+  gateway-owned values.
+- Caller-supplied base URL overrides are ignored for this provider.
+
+For the general managed-inference path, refer to
+[Inference Routing](/sandboxes/inference-routing). For provider attachment and
+profile composition, refer to [Providers v2](/sandboxes/providers-v2).

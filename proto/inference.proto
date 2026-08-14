@@ -162,6 +162,12 @@ message ResolvedRoute {
   // Optional override for the request path. When set, replaces the protocol-derived path.
   // An empty string means POST directly to base_url/model_id with no additional path.
   optional string request_path_override = 9;
+  // Absolute credential expiry. The sandbox router enforces this locally so a
+  // stale bundle cannot keep using an expired grant while the gateway is down.
+  int64 credential_expires_at_ms = 10;
+  // Gateway-resolved headers that are not agent-controlled. Values may contain
+  // account-routing material and must be treated with the same secrecy as api_key.
+  map<string, string> default_headers = 11 [(openshell.options.v1.secret) = true];
 }
 
 message GetInferenceBundleResponse {

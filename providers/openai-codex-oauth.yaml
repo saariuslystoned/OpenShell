@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: openai-codex-oauth
+display_name: OpenAI Codex Subscription (Experimental)
+description: Separate gateway-managed Sign in with ChatGPT grant for Codex subscription inference
+category: inference
+inference_capable: true
+credentials:
+  # Deliberately has no env_vars. The gateway/supervisor route consumes this
+  # credential, but provider environment resolution never injects it into the
+  # sandbox workload.
+  - name: OPENAI_CODEX_OAUTH_ACCESS_TOKEN
+    description: Gateway-only Codex subscription access token
+    required: true
+    refresh:
+      strategy: openai_codex_oauth
+      token_url: https://auth.openai.com/oauth/token
+      refresh_before_seconds: 300
+      material:
+        - name: refresh_token
+          description: Codex OAuth refresh token managed exclusively by the OpenShell gateway
+          required: true
+          secret: true
+        - name: account_id
+          description: ChatGPT account/workspace identifier bound to this grant
+          required: true
+          secret: true
+        - name: fedramp
+          description: Whether the selected ChatGPT workspace requires FedRAMP routing
+          required: true
+          secret: true
+discovery:
+  credentials: []
+# This provider grants no direct sandbox egress. Subscription traffic is
+# available only through the attached sandbox's inference.local route.
+endpoints: []
+binaries: []

@@ -156,6 +156,7 @@ mod tests {
             timeout: crate::config::DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         }
     }
 

@@ -810,6 +810,26 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
+    /// Sign in to an interactive subscription provider.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Login {
+        /// Provider name to create or re-authorize.
+        #[arg(long, default_value = "codex-subscription")]
+        name: String,
+
+        /// Print the verification URL and code without opening a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+
+    /// Revoke an interactive subscription grant and clear its gateway credential.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Logout {
+        /// Provider name to log out.
+        #[arg(long, default_value = "codex-subscription")]
+        name: String,
+    },
+
     /// Create a provider config.
     #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
@@ -3346,6 +3366,13 @@ async fn run_async() -> Result<()> {
             apply_auth(&mut tls, &ctx.name);
 
             match command {
+                ProviderCommands::Login { name, no_open } => {
+                    run::provider_codex_login(endpoint, &name, no_open, &cli.workspace, &tls)
+                        .await?;
+                }
+                ProviderCommands::Logout { name } => {
+                    run::provider_codex_logout(endpoint, &name, &cli.workspace, &tls).await?;
+                }
                 ProviderCommands::Create {
                     name,
                     provider_type,
@@ -4769,6 +4796,49 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--credential"));
         assert!(msg.contains("--from-gcloud-adc"));
+    }
+
+    #[test]
+    fn provider_codex_login_and_logout_parse_with_safe_defaults() {
+        let login = Cli::try_parse_from(["openshell", "provider", "login", "--no-open"])
+            .expect("Codex provider login should parse");
+        assert!(matches!(
+            login.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Login { name, no_open })
+            }) if name == "codex-subscription" && no_open
+        ));
+
+        let logout = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "logout",
+            "--name",
+            "personal-codex",
+        ])
+        .expect("Codex provider logout should parse");
+        assert!(matches!(
+            logout.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Logout { name })
+            }) if name == "personal-codex"
+        ));
+
+        let raw_refresh = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "configure",
+            "codex-subscription",
+            "--credential-key",
+            "OPENAI_CODEX_OAUTH_ACCESS_TOKEN",
+            "--strategy",
+            "openai-codex-oauth",
+        ]);
+        assert!(
+            raw_refresh.is_err(),
+            "Codex OAuth must use the attended provider login flow, not raw refresh material"
+        );
     }
 
     #[test]

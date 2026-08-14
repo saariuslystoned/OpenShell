@@ -1,0 +1,6 @@
+{"at":"2026-08-14T01:50:46Z","event":"lane_started","status":"in_progress","base":"c4b500a7de64d0b66e3ee8098f58d14299092162","branch":"codex/2740-openai-codex-oauth","live_mutation":false}
+{"at":"2026-08-14T01:50:46Z","event":"compile_checkpoint","status":"pass","scope":"providers,core,server,router,supervisor-network,cli,tui","live_mutation":false}
+{"at":"2026-08-14T03:20:52Z","event":"implementation_complete","status":"pass","scope":"gateway-owned Codex OAuth, attachment, pinned routing, refresh, revocation, expiry, docs","live_mutation":false}
+{"at":"2026-08-14T03:20:52Z","event":"full_ci","status":"pass","command":"mise run ci","live_mutation":false}
+{"at":"2026-08-14T03:20:52Z","event":"artifact_build","status":"pass","scope":"openshell CLI and gateway debug binaries","live_mutation":false}
+{"at":"2026-08-14T03:20:52Z","event":"upstream_gate_checked","status":"held","issue":"NVIDIA/OpenShell#2740","issue_state":"triage-needed","upstream_pr_created":false,"live_mutation":false}

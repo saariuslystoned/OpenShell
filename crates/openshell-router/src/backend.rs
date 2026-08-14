@@ -150,12 +150,32 @@ fn sanitize_request_headers(
             if should_strip_request_header(&name_lc) || !allowed.contains(&name_lc) {
                 return None;
             }
+            // These Codex subscription headers are derived from the
+            // gateway-managed OAuth grant. A sandbox must never be able to
+            // substitute another account, FedRAMP mode, or client identity.
+            // Preserve the established caller-override behavior for ordinary
+            // defaults such as anthropic-version.
+            let gateway_owned_default = is_gateway_owned_default_header(&name_lc)
+                && route
+                    .default_headers
+                    .iter()
+                    .any(|(default_name, _)| default_name.eq_ignore_ascii_case(&name_lc));
+            if gateway_owned_default {
+                return None;
+            }
             if strip_anthropic_beta && name_lc == "anthropic-beta" {
                 return None;
             }
             Some((name.clone(), value.clone()))
         })
         .collect()
+}
+
+fn is_gateway_owned_default_header(name: &str) -> bool {
+    matches!(
+        name,
+        "chatgpt-account-id" | "x-openai-fedramp" | "originator"
+    )
 }
 
 fn should_strip_request_header(name: &str) -> bool {
@@ -1070,6 +1090,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         }
     }
 
@@ -1181,6 +1202,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         };
 
         let kept = super::sanitize_request_headers(
@@ -1251,6 +1273,46 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_request_headers_rejects_codex_gateway_owned_header_overrides() {
+        let mut route = test_route(
+            "https://chatgpt.com/backend-api/codex",
+            &["openai_responses"],
+            AuthHeader::Bearer,
+        );
+        route.default_headers = vec![
+            (
+                "ChatGPT-Account-ID".to_string(),
+                "account-owned".to_string(),
+            ),
+            ("X-OpenAI-FedRAMP".to_string(), "true".to_string()),
+            ("originator".to_string(), "openshell".to_string()),
+        ];
+        route.passthrough_headers.extend([
+            "chatgpt-account-id".to_string(),
+            "x-openai-fedramp".to_string(),
+            "originator".to_string(),
+        ]);
+
+        let kept = super::sanitize_request_headers(
+            &route,
+            &[
+                (
+                    "ChatGPT-Account-ID".to_string(),
+                    "account-hostile".to_string(),
+                ),
+                ("X-OpenAI-FedRAMP".to_string(), "false".to_string()),
+                ("originator".to_string(), "hostile-client".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            kept,
+            vec![("content-type".to_string(), "application/json".to_string())]
+        );
+    }
+
+    #[test]
     fn vertex_anthropic_rawpredict_strips_anthropic_beta() {
         // Vertex AI rawPredict endpoints reject the anthropic-beta header.
         // The router must strip it before forwarding to avoid HTTP 400 errors
@@ -1268,6 +1330,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         let headers = vec![
@@ -1665,6 +1728,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -1704,6 +1768,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         let url = build_provider_url(&route, "claude-3-5-sonnet@20241022", "/v1/messages", false);
@@ -1733,6 +1798,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         let url = build_provider_url(&route, "claude-3-5-sonnet@20241022", "/v1/messages", true);
@@ -1758,6 +1824,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(String::new()),
+            credential_expires_at_ms: 0,
         };
 
         let url = build_provider_url(&route, "my-model", "/v1/messages", false);
@@ -1780,6 +1847,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: Some("/v1/chat/completions".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         let url = build_provider_url(&route, "some-model", "/v1/chat/completions", false);
@@ -1805,6 +1873,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         };
 
         let url = build_provider_url(&route, "gpt-4o", "/v1/chat/completions", false);
@@ -1830,6 +1899,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: Some("chat/completions".to_string()), // no leading slash
+            credential_expires_at_ms: 0,
         };
         let url = build_provider_url(&route, &route.model, "/v1/chat/completions", false);
         // Must not produce https://...openaichat/completions
@@ -1868,6 +1938,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -1940,6 +2011,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -2002,6 +2074,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -2070,6 +2143,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         };
 
         let client = reqwest::Client::builder().build().unwrap();
@@ -2143,6 +2217,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         }];
 
         let body = serde_json::to_vec(&serde_json::json!({
@@ -2188,6 +2263,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -2250,6 +2326,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(String::new()),
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -2315,6 +2392,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))

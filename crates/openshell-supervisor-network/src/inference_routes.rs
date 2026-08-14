@@ -308,8 +308,20 @@ pub fn bundle_to_resolved_routes(
         .routes
         .iter()
         .map(|r| {
-            let (auth, default_headers, passthrough_headers) =
+            let (auth, mut default_headers, passthrough_headers) =
                 openshell_core::inference::route_headers_for_provider_type(&r.provider_type);
+            let mut gateway_headers = r.default_headers.iter().collect::<Vec<_>>();
+            gateway_headers.sort_by(|left, right| left.0.cmp(right.0));
+            for (name, value) in gateway_headers {
+                if let Some(existing) = default_headers
+                    .iter_mut()
+                    .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                {
+                    existing.1.clone_from(value);
+                } else {
+                    default_headers.push((name.clone(), value.clone()));
+                }
+            }
             let timeout = if r.timeout_secs == 0 {
                 openshell_router::config::DEFAULT_ROUTE_TIMEOUT
             } else {
@@ -327,6 +339,7 @@ pub fn bundle_to_resolved_routes(
                 timeout,
                 model_in_path: r.model_in_path,
                 request_path_override: r.request_path_override.clone(),
+                credential_expires_at_ms: r.credential_expires_at_ms,
             }
         })
         .collect()
@@ -426,9 +439,11 @@ mod tests {
                         "openai_responses".to_string(),
                     ],
                     provider_type: "openai".to_string(),
+                    default_headers: std::collections::HashMap::new(),
                     timeout_secs: 0,
                     model_in_path: false,
                     request_path_override: None,
+                    credential_expires_at_ms: 0,
                 },
                 openshell_core::proto::ResolvedRoute {
                     name: "local".to_string(),
@@ -437,9 +452,11 @@ mod tests {
                     model_id: "llama-3".to_string(),
                     protocols: vec!["openai_chat_completions".to_string()],
                     provider_type: String::new(),
+                    default_headers: std::collections::HashMap::new(),
                     timeout_secs: 120,
                     model_in_path: false,
                     request_path_override: None,
+                    credential_expires_at_ms: 0,
                 },
             ],
             revision: "abc123".to_string(),
@@ -499,9 +516,11 @@ mod tests {
                 model_id: "model".to_string(),
                 protocols: vec!["openai_chat_completions".to_string()],
                 provider_type: "openai".to_string(),
+                default_headers: std::collections::HashMap::new(),
                 timeout_secs: 0,
                 model_in_path: false,
                 request_path_override: None,
+                credential_expires_at_ms: 0,
             }],
             revision: "rev".to_string(),
             generated_at_ms: 0,
@@ -526,6 +545,7 @@ mod tests {
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
                 model_in_path: false,
                 request_path_override: None,
+                credential_expires_at_ms: 0,
             },
             openshell_router::config::ResolvedRoute {
                 name: "sandbox-system".to_string(),
@@ -539,6 +559,7 @@ mod tests {
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
                 model_in_path: false,
                 request_path_override: None,
+                credential_expires_at_ms: 0,
             },
         ];
 
@@ -737,6 +758,7 @@ routes:
             timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         }];
 
         let cache = Arc::new(RwLock::new(routes));

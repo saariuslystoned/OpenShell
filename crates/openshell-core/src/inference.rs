@@ -59,6 +59,9 @@ pub struct InferenceProviderProfile {
     ///
     /// Header names must be lowercase and must not include auth headers.
     pub passthrough_headers: &'static [&'static str],
+    /// Whether a workspace route using this provider is visible only to
+    /// sandboxes that explicitly attach the provider instance.
+    pub requires_provider_attachment: bool,
 }
 
 const OPENAI_PROTOCOLS: &[&str] = &[
@@ -95,6 +98,23 @@ static OPENAI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     auth: AuthHeader::Bearer,
     default_headers: &[],
     passthrough_headers: &["openai-organization", "x-model-id"],
+    requires_provider_attachment: false,
+};
+
+const OPENAI_CODEX_OAUTH_PROTOCOLS: &[&str] = &["openai_responses"];
+
+/// Experimental subscription-backed Codex route. Its endpoint and request
+/// shape are intentionally centralized and have no operator override.
+static OPENAI_CODEX_OAUTH_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: "openai-codex-oauth",
+    default_base_url: "https://chatgpt.com/backend-api/codex",
+    protocols: OPENAI_CODEX_OAUTH_PROTOCOLS,
+    credential_key_names: &["OPENAI_CODEX_OAUTH_ACCESS_TOKEN"],
+    base_url_config_keys: &[],
+    auth: AuthHeader::Bearer,
+    default_headers: &[("originator", "openshell")],
+    passthrough_headers: &[],
+    requires_provider_attachment: true,
 };
 
 static ANTHROPIC_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
@@ -106,6 +126,7 @@ static ANTHROPIC_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     auth: AuthHeader::Custom("x-api-key"),
     default_headers: &[("anthropic-version", "2023-06-01")],
     passthrough_headers: &["anthropic-version", "anthropic-beta"],
+    requires_provider_attachment: false,
 };
 
 /// Credential environment variable names for the Vertex AI provider, in priority order.
@@ -153,6 +174,7 @@ static VERTEX_AI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     auth: AuthHeader::Bearer,
     default_headers: &[],
     passthrough_headers: &[],
+    requires_provider_attachment: false,
 };
 
 static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
@@ -164,6 +186,7 @@ static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     auth: AuthHeader::Bearer,
     default_headers: &[],
     passthrough_headers: &["x-model-id"],
+    requires_provider_attachment: false,
 };
 
 static DEEPINFRA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
@@ -175,6 +198,7 @@ static DEEPINFRA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     auth: AuthHeader::Bearer,
     default_headers: &[],
     passthrough_headers: &["x-model-id"],
+    requires_provider_attachment: false,
 };
 
 // AWS Bedrock — registered as bridge-fronted (no router-side auth
@@ -207,6 +231,7 @@ static AWS_BEDROCK_PROFILE: InferenceProviderProfile = InferenceProviderProfile 
     auth: AuthHeader::None,
     default_headers: &[],
     passthrough_headers: &[],
+    requires_provider_attachment: false,
 };
 
 /// Canonicalize an inference provider type string to a well-known identifier.
@@ -219,6 +244,7 @@ static AWS_BEDROCK_PROFILE: InferenceProviderProfile = InferenceProviderProfile 
 pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
     match input.trim().to_ascii_lowercase().as_str() {
         "openai" => Some("openai"),
+        "openai-codex-oauth" | "codex-subscription" => Some("openai-codex-oauth"),
         "anthropic" => Some("anthropic"),
         "nvidia" => Some("nvidia"),
         "deepinfra" => Some("deepinfra"),
@@ -237,6 +263,7 @@ pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
 pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProfile> {
     match normalize_inference_provider_type(provider_type)? {
         "openai" => Some(&OPENAI_PROFILE),
+        "openai-codex-oauth" => Some(&OPENAI_CODEX_OAUTH_PROFILE),
         "anthropic" => Some(&ANTHROPIC_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
         "deepinfra" => Some(&DEEPINFRA_PROFILE),
