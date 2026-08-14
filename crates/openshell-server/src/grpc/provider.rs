@@ -3602,6 +3602,14 @@ pub(super) async fn handle_configure_provider_refresh(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
+    let provider_is_openai_codex =
+        normalize_provider_type(&provider.r#type) == Some("openai-codex-oauth");
+    let strategy_is_openai_codex = strategy == ProviderCredentialRefreshStrategy::OpenaiCodexOauth;
+    if provider_is_openai_codex != strategy_is_openai_codex {
+        return Err(Status::failed_precondition(
+            "OpenAI Codex subscription providers require the dedicated openai_codex_oauth refresh strategy",
+        ));
+    }
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -5952,6 +5960,69 @@ mod tests {
             !provider_after_delete
                 .credential_expires_at_ms
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_provider_rejects_generic_refresh_strategy_bypass() {
+        let state = test_server_state().await;
+        let mut provider = provider_with_values("codex-subscription", "openai-codex-oauth");
+        provider.credentials.clear();
+        provider.config.clear();
+        provider.profile_workspace = "default".to_string();
+        create_provider_record(state.store.as_ref(), "default", provider)
+            .await
+            .unwrap();
+
+        let error = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                material: HashMap::from([
+                    (
+                        "refresh_token".to_string(),
+                        "pasted-refresh-token".to_string(),
+                    ),
+                    (
+                        "account_id".to_string(),
+                        "caller-selected-account".to_string(),
+                    ),
+                    ("fedramp".to_string(), "false".to_string()),
+                    (
+                        "client_id".to_string(),
+                        "caller-selected-client".to_string(),
+                    ),
+                ]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("generic OAuth refresh must not activate a Codex provider");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("dedicated openai_codex_oauth"));
+        let stored_provider = state
+            .store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .expect("provider remains");
+        assert!(
+            crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                "default",
+                stored_provider.object_id(),
+                crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "rejected generic refresh must not persist grant state"
         );
     }
 

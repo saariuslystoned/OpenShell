@@ -422,6 +422,11 @@ async fn openai_codex_route_context(
     else {
         return unavailable("OpenAI Codex subscription provider is not signed in");
     };
+    if openshell_core::proto::ProviderCredentialRefreshStrategy::try_from(refresh.strategy)
+        != Ok(openshell_core::proto::ProviderCredentialRefreshStrategy::OpenaiCodexOauth)
+    {
+        return unavailable("OpenAI Codex subscription provider has an invalid refresh strategy");
+    }
     if refresh.status != "refreshed" {
         return unavailable("OpenAI Codex subscription provider is not active");
     }
@@ -1637,6 +1642,30 @@ mod tests {
                 "{unavailable_status} grants must never be routed"
             );
         }
+
+        let mut wrong_strategy = crate::provider_refresh::get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .expect("Codex refresh state");
+        wrong_strategy.status = "refreshed".to_string();
+        wrong_strategy.strategy =
+            openshell_core::proto::ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32;
+        crate::provider_refresh::put_refresh_state(&store, &wrong_strategy)
+            .await
+            .unwrap();
+        let wrong_strategy_bundle =
+            resolve_inference_bundle_with_credentials(&store, "default", None, Some(&attached))
+                .await
+                .unwrap();
+        assert!(
+            wrong_strategy_bundle.routes.is_empty(),
+            "a stored generic refresh strategy must not activate a Codex route"
+        );
     }
 
     #[tokio::test]
