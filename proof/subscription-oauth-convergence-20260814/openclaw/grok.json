@@ -1,0 +1,50 @@
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "inference/grok-4.6"
+      },
+      "skipBootstrap": true,
+      "thinkingDefault": "off",
+      "timeoutSeconds": 120
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "inference": {
+        "baseUrl": "https://inference.local/v1",
+        "apiKey": "unused",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "grok-4.6",
+            "name": "inference/grok-4.6",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 131072,
+            "maxTokens": 128
+          }
+        ]
+      }
+    }
+  },
+  "tools": {
+    "profile": "minimal",
+    "deny": [
+      "*"
+    ],
+    "codeMode": false
+  },
+  "update": {
+    "checkOnStart": false
+  }
+}

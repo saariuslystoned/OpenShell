@@ -1,0 +1,59 @@
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openai/gpt-5.6-sol"
+      },
+      "models": {
+        "openai/gpt-5.6-sol": {
+          "agentRuntime": {
+            "id": "openclaw"
+          },
+          "params": {
+            "transport": "sse"
+          }
+        }
+      },
+      "skipBootstrap": true,
+      "thinkingDefault": "off",
+      "timeoutSeconds": 120
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "openai": {
+        "baseUrl": "https://inference.local/v1",
+        "apiKey": "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoib3BlbnNoZWxsLWluZXJ0LXNlbnRpbmVsIn19.",
+        "api": "openai-chatgpt-responses",
+        "models": [
+          {
+            "id": "gpt-5.6-sol",
+            "name": "openai/gpt-5.6-sol",
+            "reasoning": true,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 131072
+          }
+        ]
+      }
+    }
+  },
+  "tools": {
+    "profile": "minimal",
+    "deny": [
+      "*"
+    ],
+    "codeMode": false
+  },
+  "update": {
+    "checkOnStart": false
+  }
+}

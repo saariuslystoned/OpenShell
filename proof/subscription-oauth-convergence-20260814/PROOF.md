@@ -10,8 +10,12 @@
 - Codex input: `6a2a3dc6f2f32bf47067a5ef15bf78f3bdec9cb5`
 - Grok input: `da8bf1cda063cc309dde4c247218f0c9f062ec6c`
 - Writable branch: `codex/subscription-oauth-convergence-20260814`
+- Committed review head: `f8cbf77623559149e91c63385992e2acb9e8bda0`
+- Review PR: `https://github.com/saariuslystoned/OpenShell/pull/1`
 - Official xAI client reference (read-only):
   `xai-org/grok-build@eb267feff13129e568df38fb6fdf0ceb65f735d6`
+- Official OpenAI Codex reference (read-only):
+  `openai/codex@5bc8da6d78fe32343dc51eaf73b96fd288ae0e87`
 
 ## Evidence collected
 
@@ -118,6 +122,60 @@
 - Post-fix `mise run markdown:lint` and `mise run docs:build:strict` passed at
   `2026-08-14T14:17:11Z`: 120 Markdown files and 165 Mermaid-scanned files had
   zero lint errors; Fern reported zero errors and two repository warnings.
+- The exact-head proof-asset placement preflight passed with zero candidate
+  media and zero required fixes for base `c4b500a7...` and head `f8cbf776...`.
+  The first Spark materializer dry run exposed a partial-clone transport
+  limitation: the source checkout could not serve missing promisor blobs into
+  a Git bundle. A clean full clone of the already-pushed fork was detached at
+  the same exact head, verified to have zero missing diff objects, and then
+  passed both dry and live materialization. Terminal materializer proof:
+  `runs/spark-openclaw-materialize-worktree-runs/spark-openclaw-materialize-worktree-20260814T142057Z-18372/PROOF.md`.
+- The first blocking Spark review selected Claude for model diversity, but the
+  engine performed zero turns and returned `Not logged in`; this was classified
+  as a review-rail authentication failure, not a source finding or repair
+  cycle. The authenticated Codex OpenClaw engine then completed two chunked
+  passes against immutable base `c4b500a7...` and exact head `f8cbf776...`:
+  TruffleHog clean, zero accepted/actionable findings, overall patch-correct
+  confidence 0.98. Terminal proof:
+  `runs/spark-openclaw-autoreview-runs/spark-openclaw-autoreview-20260814T142159Z-21933/PROOF.md`.
+  Review cycle count remains zero.
+- PR-visible exact-head review proof was posted at
+  `https://github.com/saariuslystoned/OpenShell/pull/1#issuecomment-5294403795`.
+  The standalone ClawSweeper trigger received no workflow run, acknowledgement
+  reaction, or durable start placeholder in the immediate snapshot or the one
+  permitted 60-second recheck. It was not reposted. The fork has no tracked
+  ClawSweeper workflow on its base branch, so this is classified as external
+  workflow wiring failure; it does not invalidate the completed official
+  OpenClaw review.
+- Attended OAuth completed without exposing any code, bearer, refresh token,
+  auth store, or browser session to the agent: Grok exited zero at
+  `2026-08-14T14:56:38Z`; Codex exited zero at `2026-08-14T14:58:35Z` after
+  Bobby enabled ChatGPT device-code authorization. Both Gateway refresh workers
+  reported active provider state.
+- The live OpenClaw runtime is the official NVIDIA NemoClaw public image's
+  OpenClaw `2026.7.1` lock (`a814d82a...`) combined with official Node
+  `22.23.2`; the reviewed task bundle SHA-256 is
+  `5b68f4fae75bf09118be78c4cb7a09ef19909b011d78a9f94fc388eb1c0d1b77`.
+  The first dual-provider sandbox selected Grok second, exposed none of six
+  checked credential variables, offered zero tools, used no fallback, and
+  returned exactly `OPENSHELL_OAUTH_ROUTE_OK` over `/v1/chat/completions`.
+- Codex's first native ChatGPT Responses turn failed closed with HTTP 400.
+  Structural capture (never headers or message content) and same-route direct
+  probes isolated the cause: OpenClaw emits `max_output_tokens`, while the
+  ChatGPT Codex backend rejects that field; the otherwise identical list-form,
+  stateless, streaming request succeeds. Official OpenClaw `2026.7.1` already
+  strips this field only when it sees a `chatgpt.com` hostname, which the
+  sandbox intentionally cannot see behind `inference.local`.
+- The router now strips `max_output_tokens` only for the pinned Codex
+  subscription endpoint/protocol/path tuple and uses the supported list-form,
+  stateless validation probe. Generic API-key Responses routes retain the
+  field. The two Codex tests and generic-route negative regression passed at
+  `2026-08-14T15:28:51Z`.
+- A fresh VM attempt correctly revealed that uncommitted builds retain the old
+  `git describe` root-image cache identity and therefore still booted the prior
+  supervisor. No cache was deleted. The compatibility change is being
+  checkpoint-committed so the next VM image receives a distinct reproducible
+  source identity before the terminal live matrix.
 
 ## Required terminal evidence
 
@@ -126,8 +184,10 @@
 - Router expiry/stale-cache and deterministic multi-provider selection tests
 - CRUD-bypass, fencing, revoke/retry, and bearer-isolation tests
 - Required format, lint, unit, integration, and CI commands — complete
-- Dual-provider runtime proof and attended login/OpenClaw proof
-- Exact-head independent review and adjudication
+- Dual-provider runtime proof and attended login/OpenClaw proof — attended
+  login and Grok baseline complete; corrected Codex/rotation/logout matrix next
+- Exact-head independent review and adjudication — prior head clean; rerun
+  required after the live compatibility fix
 
 Commands, results, artifacts, and findings will be appended as the work
 advances. No credential values or auth-bearing output belong in this proof.
