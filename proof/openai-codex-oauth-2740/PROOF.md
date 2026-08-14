@@ -19,6 +19,9 @@ merge, or upstream pull request occurred.
 
 - OpenShell source base and current upstream `main` at closeout:
   `c4b500a7de64d0b66e3ee8098f58d14299092162`.
+- Source implementation commit:
+  `3a321209d6ebe5980f833f9f20c9d8290cf42910` (tree
+  `bf009fcb688e6b97b03b31f32cf31aade0aeefa9`).
 - Official Codex source was initially audited at
   `3711943d11a1c69a65afe98757814b6b5244fbaf` and the relevant public client,
   issuer, device-flow, token, revocation, subscription-backend, account-header,
