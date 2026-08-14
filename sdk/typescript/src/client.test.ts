@@ -215,6 +215,26 @@ describe('create', () => {
     expect(created.spec?.policy?.version).toBe(1);
   });
 
+  it('sends the explicit inference provider and model selection', async () => {
+    let created: {
+      spec?: { inferenceProvider?: string; inferenceModel?: string };
+    } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+
+    await sandbox.create({
+      inferenceProvider: 'grok',
+      inferenceModel: 'grok-4.6',
+    });
+
+    expect(created.spec?.inferenceProvider).toBe('grok');
+    expect(created.spec?.inferenceModel).toBe('grok-4.6');
+  });
+
   it('rawSpec reaches an ungated field and overrides a curated one', async () => {
     let created: {
       spec?: {

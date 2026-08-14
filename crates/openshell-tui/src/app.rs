@@ -820,6 +820,10 @@ fn refresh_strategy_label(strategy: i32) -> &'static str {
         openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
             "aws_sts_assume_role"
         }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::OpenaiCodexOauth => {
+            "openai_codex_oauth"
+        }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::XaiGrokOauth => "xai_grok_oauth",
         openshell_core::proto::ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }

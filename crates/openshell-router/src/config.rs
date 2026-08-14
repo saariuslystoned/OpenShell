@@ -57,10 +57,35 @@ pub struct ResolvedRoute {
     /// Optional override for the request path. When set, replaces the protocol-derived path.
     /// An empty string means POST directly to `base_url/model_id` with no additional path.
     pub request_path_override: Option<String>,
+    /// Absolute credential expiry in epoch milliseconds. Zero means unknown or
+    /// non-expiring. Enforced on every route selection, not only bundle refresh.
+    pub credential_expires_at_ms: i64,
+}
+
+impl ResolvedRoute {
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        if self.credential_expires_at_ms <= 0 {
+            return false;
+        }
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        self.credential_expires_at_ms <= now_ms
+    }
 }
 
 impl std::fmt::Debug for ResolvedRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let default_header_names = self
+            .default_headers
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
         f.debug_struct("ResolvedRoute")
             .field("name", &self.name)
             .field("endpoint", &self.endpoint)
@@ -68,11 +93,12 @@ impl std::fmt::Debug for ResolvedRoute {
             .field("api_key", &"[REDACTED]")
             .field("protocols", &self.protocols)
             .field("auth", &self.auth)
-            .field("default_headers", &self.default_headers)
+            .field("default_header_names", &default_header_names)
             .field("passthrough_headers", &self.passthrough_headers)
             .field("timeout", &self.timeout)
             .field("model_in_path", &self.model_in_path)
             .field("request_path_override", &self.request_path_override)
+            .field("credential_expires_at_ms", &self.credential_expires_at_ms)
             .finish()
     }
 }
@@ -150,6 +176,7 @@ impl RouteConfig {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         })
     }
 }
@@ -281,16 +308,28 @@ routes:
             api_key: "sk-super-secret-key-12345".to_string(),
             protocols: vec!["openai_chat_completions".to_string()],
             auth: AuthHeader::Bearer,
-            default_headers: Vec::new(),
+            default_headers: vec![(
+                "chatgpt-account-id".to_string(),
+                "sensitive-account-route".to_string(),
+            )],
             passthrough_headers: Vec::new(),
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         };
         let debug_output = format!("{route:?}");
         assert!(
             !debug_output.contains("sk-super-secret-key-12345"),
             "Debug output must not contain raw API key: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("sensitive-account-route"),
+            "Debug output must not contain default header values: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("chatgpt-account-id"),
+            "Debug output should retain non-secret header names: {debug_output}"
         );
         assert!(
             debug_output.contains("[REDACTED]"),

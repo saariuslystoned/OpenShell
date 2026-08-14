@@ -798,6 +798,8 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         labels,
         environment,
         providers,
+        inference_provider,
+        inference_model,
         gpu,
     } = spec;
     let template = image.map(|image| proto::SandboxTemplate {
@@ -812,6 +814,8 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
             environment,
             template,
             providers,
+            inference_provider: inference_provider.unwrap_or_default(),
+            inference_model: inference_model.unwrap_or_default(),
             resource_requirements,
             ..proto::SandboxSpec::default()
         }),

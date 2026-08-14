@@ -17,6 +17,7 @@ use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialTokenGrantAudienceOverride, ProviderProfile,
     ProviderProfileCredential, Sandbox, StaticCredentialBinding, StaticCredentialEndpointBinding,
 };
+use openshell_core::subscription_oauth;
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
 };
@@ -1969,9 +1970,16 @@ fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) 
 }
 
 fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
-    openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
-        == Some("google-vertex-ai")
-        && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
+    if subscription_oauth::is_non_injectable_credential(&provider.r#type, key) {
+        return true;
+    }
+    matches!(
+        (
+            openshell_core::inference::normalize_inference_provider_type(&provider.r#type),
+            key,
+        ),
+        (Some("google-vertex-ai"), "GOOGLE_SERVICE_ACCOUNT_KEY")
+    )
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
@@ -2076,6 +2084,16 @@ pub(super) async fn handle_create_provider(
     };
     if let Some(metadata) = provider.metadata.as_mut() {
         metadata.workspace.clone_from(&workspace);
+    }
+    if subscription_oauth::is_managed_provider_type(&provider.r#type)
+        && (!provider.credentials.is_empty()
+            || !provider.credential_handles.is_empty()
+            || !provider.credential_expires_at_ms.is_empty()
+            || !provider.config.is_empty())
+    {
+        return Err(Status::invalid_argument(
+            "subscription OAuth providers must be created empty and activated with provider login",
+        ));
     }
     let provider_type = provider.r#type.clone();
     let catalog = state
@@ -2645,6 +2663,37 @@ fn validate_strategy_profile_binding(
     refresh_defaults: Option<&CredentialRefreshProfile>,
     additional_output_keys: &HashMap<String, String>,
 ) -> Result<(), Status> {
+    if let Some(spec) = subscription_oauth::spec_for_strategy(strategy) {
+        let strategy_name = crate::provider_refresh::refresh_strategy_name(strategy as i32);
+        let refresh_defaults = refresh_defaults.ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "{strategy_name} requires the reviewed {} provider profile",
+                spec.provider_type
+            ))
+        })?;
+        if credential_key != spec.access_token_key {
+            return Err(Status::failed_precondition(format!(
+                "{strategy_name} requires credential_key {}",
+                spec.access_token_key
+            )));
+        }
+        let expected_scopes = spec.scopes.iter().copied().collect::<HashSet<_>>();
+        let actual_scopes = refresh_defaults
+            .scopes
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        if refresh_defaults.strategy != strategy
+            || refresh_defaults.token_url != spec.token_url
+            || actual_scopes != expected_scopes
+            || !additional_output_keys.is_empty()
+        {
+            return Err(Status::failed_precondition(format!(
+                "{strategy_name} provider profile does not match the reviewed pinned contract"
+            )));
+        }
+        return Ok(());
+    }
     let Some(expected_primary) = strategy_primary_env_key(strategy) else {
         return Ok(());
     };
@@ -2675,6 +2724,92 @@ fn validate_strategy_profile_binding(
         }
     }
     Ok(())
+}
+
+fn validate_subscription_oauth_material(
+    strategy: ProviderCredentialRefreshStrategy,
+    material: &HashMap<String, String>,
+    secret_material_keys: &[String],
+) -> Result<(), Status> {
+    let spec = subscription_oauth::spec_for_strategy(strategy).ok_or_else(|| {
+        Status::invalid_argument("strategy is not a managed subscription OAuth strategy")
+    })?;
+    let strategy_name = crate::provider_refresh::refresh_strategy_name(strategy as i32);
+    for key in material.keys() {
+        if !spec.material_keys.contains(&key.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "{strategy_name} does not accept material key '{key}'"
+            )));
+        }
+    }
+    for key in secret_material_keys {
+        if !spec.secret_material_keys.contains(&key.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "{strategy_name} does not accept secret material key '{key}'"
+            )));
+        }
+    }
+    if spec.provider == subscription_oauth::SubscriptionOauthProvider::OpenAiCodex
+        && let Some(account_id) = material.get("account_id")
+    {
+        let account_id = account_id.trim();
+        if account_id.is_empty()
+            || account_id.len() > 512
+            || account_id.parse::<reqwest::header::HeaderValue>().is_err()
+        {
+            return Err(Status::invalid_argument(
+                "openai_codex_oauth account_id is not a valid routing header value",
+            ));
+        }
+    }
+    if spec.provider == subscription_oauth::SubscriptionOauthProvider::OpenAiCodex
+        && let Some(fedramp) = material.get("fedramp")
+        && !matches!(fedramp.as_str(), "true" | "false")
+    {
+        return Err(Status::invalid_argument(
+            "openai_codex_oauth fedramp must be 'true' or 'false'",
+        ));
+    }
+    Ok(())
+}
+
+fn refresh_configuration_matches(
+    existing: &openshell_core::proto::StoredProviderCredentialRefreshState,
+    proposed: &openshell_core::proto::StoredProviderCredentialRefreshState,
+) -> bool {
+    let existing_secret_keys = existing
+        .secret_material_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let proposed_secret_keys = proposed
+        .secret_material_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let existing_scopes = existing
+        .scopes
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let proposed_scopes = proposed
+        .scopes
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+
+    existing.provider_id == proposed.provider_id
+        && existing.provider_name == proposed.provider_name
+        && existing.credential_key == proposed.credential_key
+        && existing.strategy == proposed.strategy
+        && existing.material == proposed.material
+        && existing_secret_keys == proposed_secret_keys
+        && existing.token_url == proposed.token_url
+        && existing_scopes == proposed_scopes
+        && existing.refresh_before_seconds == proposed.refresh_before_seconds
+        && existing.max_lifetime_seconds == proposed.max_lifetime_seconds
+        && existing.additional_output_keys == proposed.additional_output_keys
+        && existing.expires_at_ms == proposed.expires_at_ms
 }
 
 fn validate_refresh_material(
@@ -3229,10 +3364,39 @@ pub(super) async fn handle_update_provider(
         );
         return Err(Status::invalid_argument("provider is required"));
     };
+    let existing_provider_type = if let Some(name) = provider
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.name.trim())
+        .filter(|name| !name.is_empty())
+    {
+        state
+            .store
+            .get_message_by_name::<Provider>(&workspace, name)
+            .await
+            .map_err(|error| Status::internal(format!("fetch provider failed: {error}")))?
+            .map(|existing| existing.r#type)
+    } else {
+        None
+    };
+    let is_subscription_provider = subscription_oauth::is_managed_provider_type(&provider.r#type)
+        || existing_provider_type
+            .as_deref()
+            .is_some_and(subscription_oauth::is_managed_provider_type);
     let provider_type = provider.r#type.clone();
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
+    if is_subscription_provider
+        && (!provider.credentials.is_empty()
+            || !provider.credential_handles.is_empty()
+            || !provider.credential_expires_at_ms.is_empty()
+            || !provider.config.is_empty())
+    {
+        return Err(Status::invalid_argument(
+            "subscription OAuth credentials and routing metadata are gateway-managed; use provider login or logout",
+        ));
+    }
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3325,7 +3489,7 @@ pub(super) async fn handle_configure_provider_refresh(
     request: Request<ConfigureProviderRefreshRequest>,
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
     let principal = super::extract_principal(&request)?;
-    let request = request.into_inner();
+    let mut request = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
@@ -3360,6 +3524,23 @@ pub(super) async fn handle_configure_provider_refresh(
             "refresh strategy '{}' is not gateway-mintable; update current credentials with provider update instead",
             crate::provider_refresh::refresh_strategy_name(strategy as i32)
         )));
+    }
+    if let Some(spec) = subscription_oauth::spec_for_strategy(strategy) {
+        validate_subscription_oauth_material(
+            strategy,
+            &request.material,
+            &request.secret_material_keys,
+        )?;
+        for &key in spec.secret_material_keys {
+            if request.material.contains_key(key)
+                && !request
+                    .secret_material_keys
+                    .iter()
+                    .any(|candidate| candidate == key)
+            {
+                request.secret_material_keys.push(key.to_string());
+            }
+        }
     }
     if strategy == ProviderCredentialRefreshStrategy::AwsStsAssumeRole {
         let global_settings =
@@ -3472,6 +3653,7 @@ pub(super) async fn handle_configure_provider_refresh(
     // validation before either persisted and both reserve the same key (CWE-362).
     // This is the same guard sandbox create/attach and profile changes take.
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _refresh_operation_guard = state.provider_refresh_mutex.lock().await;
 
     let provider = state
         .store
@@ -3479,6 +3661,15 @@ pub(super) async fn handle_configure_provider_refresh(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
+    let provider_subscription_spec = subscription_oauth::spec_for_provider_type(&provider.r#type);
+    let strategy_subscription_spec = subscription_oauth::spec_for_strategy(strategy);
+    if provider_subscription_spec.map(|spec| spec.provider)
+        != strategy_subscription_spec.map(|spec| spec.provider)
+    {
+        return Err(Status::failed_precondition(
+            "subscription OAuth providers require their matching dedicated refresh strategy",
+        ));
+    }
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -3583,11 +3774,81 @@ pub(super) async fn handle_configure_provider_refresh(
             additional_output_keys,
         },
     )?;
+    if subscription_oauth::is_managed_strategy(strategy)
+        && let Some(existing) = existing_refresh_state.as_ref()
+        && existing.status != "reauth_required"
+    {
+        if refresh_configuration_matches(existing, &state_record) {
+            return Ok(Response::new(ConfigureProviderRefreshResponse {
+                status: Some(crate::provider_refresh::refresh_status_from_state(existing)),
+            }));
+        }
+        return Err(Status::failed_precondition(
+            "subscription OAuth grant already exists; revoke it before replacing the refresh state",
+        ));
+    }
     if let Some(existing) = existing_refresh_state {
+        let expected_version = existing
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.resource_version);
         state_record.metadata = existing.metadata;
         state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
+        let Some(new_version) = crate::provider_refresh::persist_refresh_state_if_current(
+            state.store.as_ref(),
+            &state_record,
+            expected_version,
+        )
+        .await?
+        else {
+            if let Some(current) = crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                &workspace,
+                provider.object_id(),
+                credential_key,
+            )
+            .await?
+                && refresh_configuration_matches(&current, &state_record)
+            {
+                return Ok(Response::new(ConfigureProviderRefreshResponse {
+                    status: Some(crate::provider_refresh::refresh_status_from_state(&current)),
+                }));
+            }
+            return Err(Status::aborted(
+                "provider refresh generation changed during configure; retry",
+            ));
+        };
+        if let Some(metadata) = state_record.metadata.as_mut() {
+            metadata.resource_version = new_version;
+        }
+    } else {
+        let Some(new_version) = crate::provider_refresh::create_refresh_state_if_absent(
+            state.store.as_ref(),
+            &state_record,
+        )
+        .await?
+        else {
+            if let Some(current) = crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                &workspace,
+                provider.object_id(),
+                credential_key,
+            )
+            .await?
+                && refresh_configuration_matches(&current, &state_record)
+            {
+                return Ok(Response::new(ConfigureProviderRefreshResponse {
+                    status: Some(crate::provider_refresh::refresh_status_from_state(&current)),
+                }));
+            }
+            return Err(Status::aborted(
+                "provider refresh generation was concurrently configured; retry",
+            ));
+        };
+        if let Some(metadata) = state_record.metadata.as_mut() {
+            metadata.resource_version = new_version;
+        }
     }
-    crate::provider_refresh::put_refresh_state(state.store.as_ref(), &state_record).await?;
 
     if let Some(expires_at_ms) = request.expires_at_ms {
         let updated = Provider {
@@ -3645,6 +3906,7 @@ pub(super) async fn handle_rotate_provider_credential(
         return Err(Status::invalid_argument("credential_key is required"));
     }
     let refresh_state = crate::provider_refresh::refresh_provider_credential(
+        &state.provider_refresh_mutex,
         state.store.as_ref(),
         &workspace,
         Some(&state.credentials),
@@ -3713,26 +3975,138 @@ pub(super) async fn handle_delete_provider_refresh(
     if credential_key.is_empty() {
         return Err(Status::invalid_argument("credential_key is required"));
     }
+    // Serialize revocation against configure/attach changes and every remote
+    // refresh. The refresh-state transition to `revoking` below remains the
+    // durable CAS fence; this process-local guard additionally prevents a
+    // rotated remote grant from being minted after its predecessor is revoked.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let _refresh_operation_guard = state.provider_refresh_mutex.lock().await;
     let provider = state
         .store
         .get_message_by_name::<Provider>(&workspace, provider_name)
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
-    let existing_refresh_state = crate::provider_refresh::get_refresh_state(
+    let mut existing_refresh_state = crate::provider_refresh::get_refresh_state(
         state.store.as_ref(),
         &workspace,
         provider.object_id(),
         credential_key,
     )
     .await?;
-    let deleted_refresh_state = crate::provider_refresh::delete_refresh_state(
-        state.store.as_ref(),
-        &workspace,
-        provider.object_id(),
-        credential_key,
-    )
-    .await?;
+    let missing_subscription_grant_is_converged = existing_refresh_state.is_none()
+        && subscription_oauth::spec_for_provider_type(&provider.r#type)
+            .is_some_and(|spec| spec.access_token_key == credential_key)
+        && request.revoke_remote
+        && request.clear_credential;
+    let expected_refresh_generation_id = request.expected_refresh_generation_id.trim();
+    if !expected_refresh_generation_id.is_empty() && existing_refresh_state.is_some() {
+        let current_refresh_generation_id = existing_refresh_state
+            .as_ref()
+            .map(|refresh_state| refresh_state.refresh_generation_id.as_str())
+            .unwrap_or_default();
+        if current_refresh_generation_id != expected_refresh_generation_id {
+            return Err(Status::aborted(
+                "provider refresh generation changed; refusing stale cleanup",
+            ));
+        }
+    } else if !expected_refresh_generation_id.is_empty() && !missing_subscription_grant_is_converged
+    {
+        return Err(Status::aborted(
+            "provider refresh generation changed; refusing stale cleanup",
+        ));
+    }
+    if existing_refresh_state
+        .as_ref()
+        .is_some_and(|refresh_state| {
+            ProviderCredentialRefreshStrategy::try_from(refresh_state.strategy)
+                .is_ok_and(subscription_oauth::is_managed_strategy)
+        })
+        && (!request.revoke_remote || !request.clear_credential)
+    {
+        return Err(Status::failed_precondition(
+            "subscription OAuth logout requires remote revocation and local credential clearing; use provider logout",
+        ));
+    }
+    let mut remote_revoke_error = None;
+    let remote_revoked = if request.revoke_remote && missing_subscription_grant_is_converged {
+        true
+    } else if request.revoke_remote {
+        let refresh_state = existing_refresh_state.as_mut().ok_or_else(|| {
+            Status::failed_precondition("provider has no subscription OAuth grant to revoke")
+        })?;
+        if !ProviderCredentialRefreshStrategy::try_from(refresh_state.strategy)
+            .is_ok_and(subscription_oauth::is_managed_strategy)
+        {
+            return Err(Status::invalid_argument(
+                "remote revocation is supported only for managed subscription OAuth strategies",
+            ));
+        }
+        if refresh_state.status == "rotating"
+            && refresh_state.next_refresh_at_ms > crate::persistence::current_time_ms()
+        {
+            return Err(Status::aborted(
+                "subscription OAuth rotation is in progress; retry logout",
+            ));
+        }
+        let expected_version = refresh_state
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.resource_version);
+        refresh_state.status = "revoking".to_string();
+        refresh_state.next_refresh_at_ms = 0;
+        refresh_state.last_error.clear();
+        let Some(claimed_version) = crate::provider_refresh::persist_refresh_state_if_current(
+            state.store.as_ref(),
+            refresh_state,
+            expected_version,
+        )
+        .await?
+        else {
+            return Err(Status::aborted(
+                "provider refresh changed while revocation started; retry logout",
+            ));
+        };
+        if let Some(metadata) = refresh_state.metadata.as_mut() {
+            metadata.resource_version = claimed_version;
+        }
+        if let Err(error) = crate::provider_refresh::revoke_subscription_oauth(refresh_state).await
+        {
+            refresh_state.status = "revoke_failed".to_string();
+            refresh_state.last_error = error.message().to_string();
+            let Some(failed_version) = crate::provider_refresh::persist_refresh_state_if_current(
+                state.store.as_ref(),
+                refresh_state,
+                claimed_version,
+            )
+            .await?
+            else {
+                return Err(Status::aborted(
+                    "provider refresh changed while revocation failed; retry logout",
+                ));
+            };
+            if let Some(metadata) = refresh_state.metadata.as_mut() {
+                metadata.resource_version = failed_version;
+            }
+            remote_revoke_error = Some(error);
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+    let deleted_before_cleanup = if request.revoke_remote {
+        false
+    } else {
+        crate::provider_refresh::delete_refresh_state(
+            state.store.as_ref(),
+            &workspace,
+            provider.object_id(),
+            credential_key,
+        )
+        .await?
+    };
 
     // A refresh co-manages the expiry of its primary credential and every pinned
     // additional output. Clear each expiry this refresh still owns, leaving
@@ -3740,12 +4114,12 @@ pub(super) async fn handle_delete_provider_refresh(
     // inside the CAS closure so they see the current stored provider — deciding
     // from the snapshot read above would let a concurrent rotation or provider
     // update land between the read and the write and then be clobbered (CWE-362).
-    if let Some(refresh_state) = existing_refresh_state
+    if let Some(refresh_state) = existing_refresh_state.as_ref()
         && refresh_state.expires_at_ms > 0
     {
         let refresh_expires_at_ms = refresh_state.expires_at_ms;
         let owned_keys: Vec<String> = std::iter::once(credential_key.to_string())
-            .chain(refresh_state.additional_output_keys.into_values())
+            .chain(refresh_state.additional_output_keys.values().cloned())
             .collect();
         state
             .store
@@ -3760,8 +4134,79 @@ pub(super) async fn handle_delete_provider_refresh(
             })?;
     }
 
+    let credential_cleared = if request.clear_credential {
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), &workspace)
+            .await?;
+        let update = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: provider_name.to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: String::new(),
+                deletion_timestamp_ms: 0,
+            }),
+            r#type: String::new(),
+            credentials: HashMap::from([(credential_key.to_string(), String::new())]),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::from([(credential_key.to_string(), 0)]),
+            profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
+        };
+        update_provider_record_validating(
+            state.store.as_ref(),
+            &workspace,
+            &catalog,
+            update,
+            Some(&state.credentials),
+        )
+        .await?;
+        true
+    } else {
+        false
+    };
+
+    // A remote revocation failure remains durably retryable through the
+    // `revoke_failed` refresh state, but the short-lived local access token is
+    // still cleared before returning the failure. Keeping the refresh token is
+    // necessary to retry the authority; keeping the locally usable bearer is
+    // not. The state transition above already makes the route unroutable, and
+    // this clearing step closes the storage side of the same fail-closed gate.
+    if let Some(error) = remote_revoke_error {
+        return Err(error);
+    }
+
+    let deleted_refresh_state = if request.revoke_remote && existing_refresh_state.is_none() {
+        missing_subscription_grant_is_converged
+    } else if request.revoke_remote {
+        let deleted = crate::provider_refresh::delete_refresh_state(
+            state.store.as_ref(),
+            &workspace,
+            provider.object_id(),
+            credential_key,
+        )
+        .await?;
+        deleted
+            || crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                &workspace,
+                provider.object_id(),
+                credential_key,
+            )
+            .await?
+            .is_none()
+    } else {
+        deleted_before_cleanup
+    };
+
     Ok(Response::new(DeleteProviderRefreshResponse {
         deleted: deleted_refresh_state,
+        remote_revoked,
+        credential_cleared,
     }))
 }
 
@@ -3783,6 +4228,27 @@ pub(super) async fn handle_delete_provider(
         .await?
         .name;
     let name = req.name;
+    // Serialize the subscription grant check with refresh configuration, logout, and
+    // sandbox attachment changes. A generic provider delete must not erase the
+    // only gateway copy of a still-live remote grant before it is revoked.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    if let Some(provider) = state
+        .store
+        .get_message_by_name::<Provider>(&workspace, &name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+        && subscription_oauth::is_managed_provider_type(&provider.r#type)
+        && !crate::provider_refresh::list_refresh_states_for_provider(
+            state.store.as_ref(),
+            provider.object_id(),
+        )
+        .await?
+        .is_empty()
+    {
+        return Err(Status::failed_precondition(format!(
+            "provider '{name}' still owns a subscription OAuth grant; run 'openshell provider logout --name {name}' before deleting it"
+        )));
+    }
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &workspace, &name).await;
     let result = delete_provider_record_with_credentials(
         state.store.as_ref(),
@@ -3885,6 +4351,25 @@ mod tests {
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
+    use wiremock::matchers::{body_json, body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+    struct FailOnceThenSucceed {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Respond for FailOnceThenSucceed {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                ResponseTemplate::new(500).set_body_string("response-secret-canary")
+            } else {
+                ResponseTemplate::new(200)
+            }
+        }
+    }
 
     #[test]
     fn env_key_validation_accepts_valid_keys() {
@@ -4568,6 +5053,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn subscription_access_tokens_are_never_sandbox_injectable() {
+        for (name, provider_type, credential_key) in [
+            (
+                "codex-subscription",
+                subscription_oauth::OPENAI_CODEX_PROVIDER_TYPE,
+                subscription_oauth::OPENAI_CODEX_ACCESS_TOKEN_KEY,
+            ),
+            (
+                "grok-subscription",
+                subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+                subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+            ),
+        ] {
+            let mut provider = provider_with_values(name, provider_type);
+            provider.config.clear();
+            provider.credentials = HashMap::from([(
+                credential_key.to_string(),
+                "access-token-canary".to_string(),
+            )]);
+            assert!(is_non_injectable_provider_credential(
+                &provider,
+                credential_key
+            ));
+            assert!(
+                active_provider_credential_keys(&provider, crate::persistence::current_time_ms())
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn openai_codex_material_accepts_only_pinned_header_safe_shape() {
+        let valid = HashMap::from([
+            ("refresh_token".to_string(), "refresh-token".to_string()),
+            ("account_id".to_string(), "account-123".to_string()),
+            ("fedramp".to_string(), "false".to_string()),
+        ]);
+        validate_subscription_oauth_material(
+            ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+            &valid,
+            &[],
+        )
+        .unwrap();
+
+        for (key, value) in [
+            ("fedramp", "yes"),
+            ("account_id", "account-123\r\nx-injected: true"),
+            ("test_auth_base_url", "https://attacker.invalid"),
+        ] {
+            let mut invalid = valid.clone();
+            invalid.insert(key.to_string(), value.to_string());
+            assert!(
+                validate_subscription_oauth_material(
+                    ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+                    &invalid,
+                    &[],
+                )
+                .is_err(),
+                "{key} must fail the reviewed material contract"
+            );
+        }
+        assert!(
+            validate_subscription_oauth_material(
+                ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+                &valid,
+                &["unexpected".to_string()],
+            )
+            .is_err(),
+            "unknown secret keys must fail the reviewed material contract"
+        );
+    }
+
     fn provider_with_credential_handle(
         name: &str,
         provider_type: &str,
@@ -4785,7 +5343,9 @@ mod tests {
                 "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
-                "pypi"
+                "openai-codex-oauth",
+                "pypi",
+                "xai-grok-oauth"
             ]
         );
 
@@ -5568,6 +6128,9 @@ mod tests {
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 workspace: "default".to_string(),
+                revoke_remote: false,
+                clear_credential: false,
+                expected_refresh_generation_id: String::new(),
             }),
         )
         .await
@@ -5599,6 +6162,882 @@ mod tests {
                 .credential_expires_at_ms
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
         );
+    }
+
+    #[tokio::test]
+    async fn codex_provider_rejects_generic_refresh_strategy_bypass() {
+        let state = test_server_state().await;
+        let mut provider = provider_with_values("codex-subscription", "openai-codex-oauth");
+        provider.credentials.clear();
+        provider.config.clear();
+        provider.profile_workspace = "default".to_string();
+        create_provider_record(state.store.as_ref(), "default", provider)
+            .await
+            .unwrap();
+
+        let error = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                material: HashMap::from([
+                    (
+                        "refresh_token".to_string(),
+                        "pasted-refresh-token".to_string(),
+                    ),
+                    (
+                        "account_id".to_string(),
+                        "caller-selected-account".to_string(),
+                    ),
+                    ("fedramp".to_string(), "false".to_string()),
+                    (
+                        "client_id".to_string(),
+                        "caller-selected-client".to_string(),
+                    ),
+                ]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("generic OAuth refresh must not activate a Codex provider");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("matching dedicated refresh strategy")
+        );
+        let stored_provider = state
+            .store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .expect("provider remains");
+        assert!(
+            crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                "default",
+                stored_provider.object_id(),
+                crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "rejected generic refresh must not persist grant state"
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_subscription_configure_is_pinned_idempotent_and_nonreplaceable() {
+        let state = test_server_state().await;
+        crate::grpc::policy::set_global_bool_setting_for_test(
+            state.store.as_ref(),
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+        let mut provider = provider_with_values(
+            "grok-subscription",
+            subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+        );
+        provider.credentials.clear();
+        provider.config.clear();
+        provider.profile_workspace = "default".to_string();
+        let provider = create_provider_record(state.store.as_ref(), "default", provider)
+            .await
+            .unwrap();
+
+        let request = ConfigureProviderRefreshRequest {
+            provider: "grok-subscription".to_string(),
+            credential_key: subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY.to_string(),
+            strategy: ProviderCredentialRefreshStrategy::XaiGrokOauth as i32,
+            material: HashMap::from([(
+                "refresh_token".to_string(),
+                "grok-refresh-token-canary".to_string(),
+            )]),
+            secret_material_keys: vec!["refresh_token".to_string()],
+            expires_at_ms: None,
+            workspace: "default".to_string(),
+        };
+        let first = handle_configure_provider_refresh(&state, authed_request(request.clone()))
+            .await
+            .unwrap()
+            .into_inner()
+            .status
+            .expect("configured status");
+        assert_eq!(first.status, "configured");
+        assert!(!first.refresh_generation_id.is_empty());
+        let before_retry = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let repeated = handle_configure_provider_refresh(&state, authed_request(request.clone()))
+            .await
+            .expect("an identical configure retry must be idempotent")
+            .into_inner()
+            .status
+            .expect("configured status");
+        assert_eq!(repeated.refresh_generation_id, first.refresh_generation_id);
+        let after_retry = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            after_retry
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.resource_version),
+            before_retry
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.resource_version),
+            "idempotent configure must not create a new generation or write"
+        );
+
+        let mut replacement = request.clone();
+        replacement.material.insert(
+            "refresh_token".to_string(),
+            "different-grok-refresh-token".to_string(),
+        );
+        let replacement_error =
+            handle_configure_provider_refresh(&state, authed_request(replacement))
+                .await
+                .expect_err("an active Grok grant must not be replaced");
+        assert_eq!(replacement_error.code(), Code::FailedPrecondition);
+        assert!(
+            replacement_error
+                .message()
+                .contains("revoke it before replacing")
+        );
+
+        let mut generic = request;
+        generic.strategy = ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32;
+        let generic_error = handle_configure_provider_refresh(&state, authed_request(generic))
+            .await
+            .expect_err("generic OAuth refresh must not activate a Grok provider");
+        assert_eq!(generic_error.code(), Code::FailedPrecondition);
+        assert!(
+            generic_error
+                .message()
+                .contains("matching dedicated refresh strategy")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_logout_fails_closed_then_retries_revocation_before_local_cleanup() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/revoke"))
+            .and(header("originator", "openshell"))
+            .and(body_json(serde_json::json!({
+                "client_id": crate::provider_refresh::OPENAI_CODEX_OAUTH_CLIENT_ID,
+                "token": "refresh-token-canary",
+                "token_type_hint": "refresh_token"
+            })))
+            .respond_with(FailOnceThenSucceed {
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let state = test_server_state().await;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+        let mut provider = provider_with_values("codex-subscription", "openai-codex-oauth");
+        provider.config.clear();
+        provider.credentials = HashMap::from([(
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY.to_string(),
+            "access-token-canary".to_string(),
+        )]);
+        provider.credential_expires_at_ms = HashMap::from([(
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY.to_string(),
+            expires_at_ms,
+        )]);
+        create_provider_record(state.store.as_ref(), "default", provider)
+            .await
+            .unwrap();
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut refresh = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "default",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+                material: HashMap::from([
+                    (
+                        "refresh_token".to_string(),
+                        "refresh-token-canary".to_string(),
+                    ),
+                    ("account_id".to_string(), "account-route-123".to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                    ("test_auth_base_url".to_string(), mock_server.uri()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms,
+                token_url: crate::provider_refresh::OPENAI_CODEX_OAUTH_TOKEN_URL.to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .unwrap();
+        refresh.status = "refreshed".to_string();
+        let refresh_generation_id = refresh.refresh_generation_id.clone();
+        assert!(!refresh_generation_id.is_empty());
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &refresh)
+            .await
+            .unwrap();
+
+        crate::grpc::policy::set_global_bool_setting_for_test(
+            state.store.as_ref(),
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+        let replace_error = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth as i32,
+                material: HashMap::from([
+                    ("refresh_token".to_string(), "replacement-grant".to_string()),
+                    ("account_id".to_string(), "account-route-123".to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("an active Codex grant must not be overwritten");
+        assert_eq!(replace_error.code(), Code::FailedPrecondition);
+        assert!(
+            replace_error
+                .message()
+                .contains("revoke it before replacing")
+        );
+
+        let bypass_error = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: false,
+                clear_credential: false,
+                expected_refresh_generation_id: String::new(),
+            }),
+        )
+        .await
+        .expect_err("Codex state deletion must not bypass remote revocation");
+        assert_eq!(bypass_error.code(), Code::FailedPrecondition);
+        assert!(bypass_error.message().contains("provider logout"));
+
+        let retained_credential_error = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: true,
+                clear_credential: false,
+                expected_refresh_generation_id: refresh_generation_id.clone(),
+            }),
+        )
+        .await
+        .expect_err("Codex logout must not retain a cached access token");
+        assert_eq!(retained_credential_error.code(), Code::FailedPrecondition);
+        assert!(
+            retained_credential_error
+                .message()
+                .contains("credential clearing")
+        );
+
+        let stale_cleanup_error = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: true,
+                clear_credential: true,
+                expected_refresh_generation_id: "different-grant-generation".to_string(),
+            }),
+        )
+        .await
+        .expect_err("stale cleanup must not revoke the current grant");
+        assert_eq!(stale_cleanup_error.code(), Code::Aborted);
+        assert!(
+            stale_cleanup_error
+                .message()
+                .contains("refresh generation changed")
+        );
+        let state_after_stale_cleanup = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .expect("stale cleanup preserves the current refresh state");
+        assert_eq!(
+            state_after_stale_cleanup.refresh_generation_id,
+            refresh_generation_id
+        );
+
+        let first_error = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: true,
+                clear_credential: true,
+                expected_refresh_generation_id: refresh_generation_id.clone(),
+            }),
+        )
+        .await
+        .expect_err("failed remote revocation must preserve fenced local state");
+        assert_eq!(first_error.code(), Code::Unavailable);
+        assert!(!first_error.message().contains("response-secret-canary"));
+        let failed_state = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .expect("failed revocation remains retryable");
+        assert_eq!(failed_state.status, "revoke_failed");
+        let provider_after_failure = state
+            .store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !provider_after_failure
+                .credentials
+                .contains_key(crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY),
+            "failed remote revoke must still clear the locally usable bearer"
+        );
+        assert!(
+            !provider_after_failure
+                .credential_expires_at_ms
+                .contains_key(crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY)
+        );
+
+        let response = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: true,
+                clear_credential: true,
+                expected_refresh_generation_id: refresh_generation_id.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.deleted);
+        assert!(response.remote_revoked);
+        assert!(response.credential_cleared);
+        assert!(
+            crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                "default",
+                provider.object_id(),
+                crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !provider
+                .credentials
+                .contains_key(crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY)
+        );
+        assert!(
+            !provider
+                .credential_expires_at_ms
+                .contains_key(crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY)
+        );
+
+        let repeated = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "codex-subscription".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: true,
+                clear_credential: true,
+                expected_refresh_generation_id: refresh_generation_id,
+            }),
+        )
+        .await
+        .expect("repeating a completed logout should converge without another remote call")
+        .into_inner();
+        assert!(repeated.deleted);
+        assert!(repeated.remote_revoked);
+        assert!(repeated.credential_cleared);
+    }
+
+    #[tokio::test]
+    async fn grok_logout_revokes_only_its_selected_grant() {
+        let grok_auth = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/revoke"))
+            .and(body_string_contains("token=grok-refresh-token-canary"))
+            .and(body_string_contains(format!(
+                "client_id={}",
+                subscription_oauth::XAI_GROK_CLIENT_ID
+            )))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&grok_auth)
+            .await;
+
+        let state = test_server_state().await;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+        let mut codex = provider_with_values(
+            "codex-subscription",
+            subscription_oauth::OPENAI_CODEX_PROVIDER_TYPE,
+        );
+        codex.config.clear();
+        codex.credentials = HashMap::from([(
+            subscription_oauth::OPENAI_CODEX_ACCESS_TOKEN_KEY.to_string(),
+            "codex-access-token-canary".to_string(),
+        )]);
+        codex.credential_expires_at_ms = HashMap::from([(
+            subscription_oauth::OPENAI_CODEX_ACCESS_TOKEN_KEY.to_string(),
+            expires_at_ms,
+        )]);
+        let codex = create_provider_record(state.store.as_ref(), "default", codex)
+            .await
+            .unwrap();
+        let mut codex_refresh = crate::provider_refresh::new_refresh_state(
+            &codex,
+            "default",
+            subscription_oauth::OPENAI_CODEX_ACCESS_TOKEN_KEY,
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+                material: HashMap::from([
+                    (
+                        "refresh_token".to_string(),
+                        "codex-refresh-token-canary".to_string(),
+                    ),
+                    ("account_id".to_string(), "account-123".to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms,
+                token_url: subscription_oauth::OPENAI_CODEX_TOKEN_URL.to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+            },
+        )
+        .unwrap();
+        codex_refresh.status = "refreshed".to_string();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &codex_refresh)
+            .await
+            .unwrap();
+
+        let mut grok = provider_with_values(
+            "grok-subscription",
+            subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+        );
+        grok.config.clear();
+        grok.credentials = HashMap::from([(
+            subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY.to_string(),
+            "grok-access-token-canary".to_string(),
+        )]);
+        grok.credential_expires_at_ms = HashMap::from([(
+            subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY.to_string(),
+            expires_at_ms,
+        )]);
+        let grok = create_provider_record(state.store.as_ref(), "default", grok)
+            .await
+            .unwrap();
+        let mut grok_refresh = crate::provider_refresh::new_refresh_state(
+            &grok,
+            "default",
+            subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::XaiGrokOauth,
+                material: HashMap::from([
+                    (
+                        "refresh_token".to_string(),
+                        "grok-refresh-token-canary".to_string(),
+                    ),
+                    ("test_auth_base_url".to_string(), grok_auth.uri()),
+                ]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms,
+                token_url: subscription_oauth::XAI_GROK_TOKEN_URL.to_string(),
+                scopes: subscription_oauth::XAI_GROK_SCOPES
+                    .iter()
+                    .map(|scope| (*scope).to_string())
+                    .collect(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+            },
+        )
+        .unwrap();
+        grok_refresh.status = "refreshed".to_string();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &grok_refresh)
+            .await
+            .unwrap();
+
+        let result = handle_delete_provider_refresh(
+            &state,
+            authed_request(DeleteProviderRefreshRequest {
+                provider: "grok-subscription".to_string(),
+                credential_key: subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY.to_string(),
+                workspace: "default".to_string(),
+                revoke_remote: true,
+                clear_credential: true,
+                expected_refresh_generation_id: grok_refresh.refresh_generation_id,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(result.deleted && result.remote_revoked && result.credential_cleared);
+        assert!(
+            crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                "default",
+                grok.object_id(),
+                subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let grok_after = state
+            .store
+            .get_message_by_name::<Provider>("default", "grok-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !grok_after
+                .credentials
+                .contains_key(subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY)
+        );
+
+        let codex_after = state
+            .store
+            .get_message_by_name::<Provider>("default", "codex-subscription")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            codex_after.credentials[subscription_oauth::OPENAI_CODEX_ACCESS_TOKEN_KEY],
+            "codex-access-token-canary"
+        );
+        assert!(
+            crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                "default",
+                codex.object_id(),
+                subscription_oauth::OPENAI_CODEX_ACCESS_TOKEN_KEY,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_rotation_and_logout_share_remote_operation_fence() {
+        let state = test_server_state().await;
+        let operation_guard = state.provider_refresh_mutex.lock().await;
+
+        let rotate_state = Arc::clone(&state);
+        let rotate = tokio::spawn(async move {
+            handle_rotate_provider_credential(
+                &rotate_state,
+                authed_request(RotateProviderCredentialRequest {
+                    provider: "codex-subscription".to_string(),
+                    credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                        .to_string(),
+                    workspace: "default".to_string(),
+                }),
+            )
+            .await
+        });
+
+        let logout_state = Arc::clone(&state);
+        let logout = tokio::spawn(async move {
+            handle_delete_provider_refresh(
+                &logout_state,
+                authed_request(DeleteProviderRefreshRequest {
+                    provider: "codex-subscription".to_string(),
+                    credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                        .to_string(),
+                    workspace: "default".to_string(),
+                    revoke_remote: true,
+                    clear_credential: true,
+                    expected_refresh_generation_id: String::new(),
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !rotate.is_finished(),
+            "manual rotation must wait behind the shared remote-operation fence"
+        );
+        assert!(
+            !logout.is_finished(),
+            "remote logout must wait behind the shared remote-operation fence"
+        );
+
+        rotate.abort();
+        logout.abort();
+        drop(operation_guard);
+        assert!(rotate.await.unwrap_err().is_cancelled());
+        assert!(logout.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn codex_reauthorization_rotates_the_cleanup_generation_fence() {
+        let state = test_server_state().await;
+        crate::grpc::policy::set_global_bool_setting_for_test(
+            state.store.as_ref(),
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+        let provider = create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_values("codex-reauth", "openai-codex-oauth"),
+        )
+        .await
+        .unwrap();
+        let mut old_state = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "default",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+                material: HashMap::from([
+                    ("refresh_token".to_string(), "expired-grant".to_string()),
+                    ("account_id".to_string(), "account-old".to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms: 0,
+                token_url: crate::provider_refresh::OPENAI_CODEX_OAUTH_TOKEN_URL.to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .unwrap();
+        old_state.status = "reauth_required".to_string();
+        let old_metadata_id = old_state.metadata.as_ref().unwrap().id.clone();
+        let old_generation_id = old_state.refresh_generation_id.clone();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &old_state)
+            .await
+            .unwrap();
+
+        let response = handle_configure_provider_refresh(
+            &state,
+            authed_request(ConfigureProviderRefreshRequest {
+                provider: "codex-reauth".to_string(),
+                credential_key: crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY
+                    .to_string(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth as i32,
+                material: HashMap::from([
+                    ("refresh_token".to_string(), "replacement-grant".to_string()),
+                    ("account_id".to_string(), "account-new".to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms: None,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let status = response.status.expect("configured status");
+        assert!(!status.refresh_generation_id.is_empty());
+        assert_ne!(status.refresh_generation_id, old_generation_id);
+
+        let replacement = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap()
+        .expect("replacement refresh state");
+        assert_eq!(
+            replacement.refresh_generation_id,
+            status.refresh_generation_id
+        );
+        assert_eq!(replacement.metadata.as_ref().unwrap().id, old_metadata_id);
+        assert_eq!(
+            replacement
+                .material
+                .get("refresh_token")
+                .map(String::as_str),
+            Some("replacement-grant")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_provider_delete_requires_logout_before_local_deletion() {
+        let state = test_server_state().await;
+        let provider = create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_values("codex-subscription", "openai-codex-oauth"),
+        )
+        .await
+        .unwrap();
+        let refresh_state = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "default",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::OpenaiCodexOauth,
+                material: HashMap::from([
+                    ("refresh_token".to_string(), "remote-grant".to_string()),
+                    ("account_id".to_string(), "account-123".to_string()),
+                    ("fedramp".to_string(), "false".to_string()),
+                ]),
+                secret_material_keys: vec![
+                    "refresh_token".to_string(),
+                    "account_id".to_string(),
+                    "fedramp".to_string(),
+                ],
+                expires_at_ms: 0,
+                token_url: crate::provider_refresh::OPENAI_CODEX_OAUTH_TOKEN_URL.to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+            },
+        )
+        .unwrap();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &refresh_state)
+            .await
+            .unwrap();
+
+        let error = handle_delete_provider(
+            &state,
+            authed_request(DeleteProviderRequest {
+                name: "codex-subscription".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("provider logout"));
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Provider>("default", "codex-subscription")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        crate::provider_refresh::delete_refresh_state(
+            state.store.as_ref(),
+            "default",
+            provider.object_id(),
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+        )
+        .await
+        .unwrap();
+        let deleted = handle_delete_provider(
+            &state,
+            authed_request(DeleteProviderRequest {
+                name: "codex-subscription".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(deleted.deleted);
     }
 
     async fn state_with_authoritative_profiles_over_default_grants() -> Arc<ServerState> {
@@ -5727,6 +7166,9 @@ mod tests {
                 provider: "provider-a".to_string(),
                 credential_key: "REFRESH_TOKEN".to_string(),
                 workspace: "default".to_string(),
+                revoke_remote: false,
+                clear_credential: false,
+                expected_refresh_generation_id: String::new(),
             }),
         )
         .await
@@ -5902,6 +7344,9 @@ mod tests {
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
                 workspace: "default".to_string(),
+                revoke_remote: false,
+                clear_credential: false,
+                expected_refresh_generation_id: String::new(),
             }),
         )
         .await
@@ -6018,6 +7463,9 @@ mod tests {
                 provider: "aws-delete".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
                 workspace: "default".to_string(),
+                revoke_remote: false,
+                clear_credential: false,
+                expected_refresh_generation_id: String::new(),
             }),
         )
         .await
@@ -6918,6 +8366,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_provider_create_rejects_pasted_access_tokens() {
+        let state = test_server_state().await;
+        let mut provider = provider_with_credential_value(
+            "codex-subscription",
+            "openai-codex-oauth",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            "pasted-access-token-canary",
+        );
+        provider.credential_expires_at_ms.insert(
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY.to_string(),
+            crate::persistence::current_time_ms() + 60_000,
+        );
+
+        let error = handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(provider),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("Codex providers must start through the attended grant flow");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("created empty"));
+        assert!(!error.message().contains("pasted-access-token-canary"));
+    }
+
+    #[tokio::test]
+    async fn grok_provider_create_rejects_pasted_tokens_and_routing_config() {
+        let state = test_server_state().await;
+        let mut provider = provider_with_credential_value(
+            "grok-subscription",
+            subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+            subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+            "pasted-grok-access-token-canary",
+        );
+        provider.config.insert(
+            "XAI_BASE_URL".to_string(),
+            "https://attacker.invalid/steal".to_string(),
+        );
+
+        let error = handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(provider),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("Grok providers must start through the attended grant flow");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("created empty"));
+        assert!(!error.message().contains("pasted-grok-access-token-canary"));
+        assert!(!error.message().contains("attacker.invalid"));
+    }
+
+    #[tokio::test]
     async fn handle_create_provider_stores_inline_credentials_with_enabled_driver() {
         let mut state = test_server_state().await;
         let config = state
@@ -7009,6 +8516,151 @@ mod tests {
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("internal gateway state"));
+    }
+
+    #[tokio::test]
+    async fn codex_provider_update_rejects_direct_credential_replacement() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_values("codex-subscription", "openai-codex-oauth"),
+        )
+        .await
+        .unwrap();
+        let mut update = provider_with_credential_value(
+            "codex-subscription",
+            "",
+            crate::provider_refresh::OPENAI_CODEX_OAUTH_ACCESS_TOKEN_KEY,
+            "replacement-access-token-canary",
+        );
+        update.r#type.clear();
+
+        let error = handle_update_provider(
+            &state,
+            authed_request(UpdateProviderRequest {
+                provider: Some(update),
+                credential_expires_at_ms: HashMap::new(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("ordinary provider update must not replace a Codex OAuth credential");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("gateway-managed"));
+        assert!(!error.message().contains("replacement-access-token-canary"));
+    }
+
+    #[tokio::test]
+    async fn grok_provider_update_rejects_direct_credential_replacement() {
+        let state = test_server_state().await;
+        let mut provider = provider_with_values(
+            "grok-subscription",
+            subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+        );
+        provider.credentials.clear();
+        provider.config.clear();
+        create_provider_record(state.store.as_ref(), "default", provider)
+            .await
+            .unwrap();
+        let mut update = provider_with_credential_value(
+            "grok-subscription",
+            "",
+            subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+            "replacement-grok-access-token-canary",
+        );
+        update.r#type.clear();
+
+        let error = handle_update_provider(
+            &state,
+            authed_request(UpdateProviderRequest {
+                provider: Some(update),
+                credential_expires_at_ms: HashMap::new(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("ordinary provider update must not replace a Grok OAuth credential");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("gateway-managed"));
+        assert!(
+            !error
+                .message()
+                .contains("replacement-grok-access-token-canary")
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_delete_cannot_orphan_a_grok_subscription_grant() {
+        let state = test_server_state().await;
+        let mut provider = provider_with_values(
+            "grok-subscription",
+            subscription_oauth::XAI_GROK_PROVIDER_TYPE,
+        );
+        provider.credentials.clear();
+        provider.config.clear();
+        let provider = create_provider_record(state.store.as_ref(), "default", provider)
+            .await
+            .unwrap();
+        let refresh = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "default",
+            subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::XaiGrokOauth,
+                material: HashMap::from([(
+                    "refresh_token".to_string(),
+                    "grok-refresh-token-canary".to_string(),
+                )]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms: 0,
+                token_url: subscription_oauth::XAI_GROK_TOKEN_URL.to_string(),
+                scopes: subscription_oauth::XAI_GROK_SCOPES
+                    .iter()
+                    .map(|scope| (*scope).to_string())
+                    .collect(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+            },
+        )
+        .unwrap();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &refresh)
+            .await
+            .unwrap();
+
+        let error = handle_delete_provider(
+            &state,
+            authed_request(DeleteProviderRequest {
+                name: "grok-subscription".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("generic delete must require subscription logout first");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("provider logout"));
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Provider>("default", "grok-subscription")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                "default",
+                provider.object_id(),
+                subscription_oauth::XAI_GROK_ACCESS_TOKEN_KEY,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[tokio::test]

@@ -374,6 +374,8 @@ pub struct SandboxCreateConfig<'a> {
     pub driver_config_json: Option<&'a str>,
     pub editor: Option<Editor>,
     pub providers: &'a [String],
+    pub inference_provider: Option<&'a str>,
+    pub inference_model: Option<&'a str>,
     pub policy: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
     pub command: &'a [String],
@@ -398,6 +400,8 @@ impl Default for SandboxCreateConfig<'_> {
             driver_config_json: None,
             editor: None,
             providers: &[],
+            inference_provider: None,
+            inference_model: None,
             policy: None,
             forward: None,
             command: &[],
@@ -430,6 +434,8 @@ pub async fn sandbox_create(
         driver_config_json,
         editor,
         providers,
+        inference_provider,
+        inference_model,
         policy,
         forward,
         command,
@@ -527,6 +533,8 @@ pub async fn sandbox_create(
             environment,
             policy,
             providers: configured_providers,
+            inference_provider: inference_provider.unwrap_or_default().to_string(),
+            inference_model: inference_model.unwrap_or_default().to_string(),
             template,
             ..SandboxSpec::default()
         }),
@@ -3248,6 +3256,479 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
     }
 }
 
+struct AttendedSubscriptionGrant {
+    refresh_token: String,
+    material: HashMap<String, String>,
+}
+
+/// Provider-specific attended authorization/exchange and failed-handoff revoke
+/// behavior behind the provider-neutral login/configure/rotate lifecycle.
+#[tonic::async_trait]
+trait SubscriptionLoginAdapter: Sync {
+    fn spec(&self) -> &'static openshell_core::subscription_oauth::SubscriptionOauthSpec;
+
+    async fn attended_grant(&self, no_open: bool) -> Result<AttendedSubscriptionGrant>;
+
+    async fn revoke_unclaimed_grant(&self, refresh_token: &str) -> Result<()>;
+}
+
+struct OpenAiCodexLoginAdapter;
+struct XaiGrokLoginAdapter;
+
+static OPENAI_CODEX_LOGIN_ADAPTER: OpenAiCodexLoginAdapter = OpenAiCodexLoginAdapter;
+static XAI_GROK_LOGIN_ADAPTER: XaiGrokLoginAdapter = XaiGrokLoginAdapter;
+
+#[tonic::async_trait]
+impl SubscriptionLoginAdapter for OpenAiCodexLoginAdapter {
+    fn spec(&self) -> &'static openshell_core::subscription_oauth::SubscriptionOauthSpec {
+        &openshell_core::subscription_oauth::OPENAI_CODEX_SPEC
+    }
+
+    async fn attended_grant(&self, no_open: bool) -> Result<AttendedSubscriptionGrant> {
+        let device = crate::codex_oauth::request_device_code().await?;
+        println!("Open this URL to sign in with ChatGPT:");
+        println!("  {}", device.verification_url);
+        println!("Enter this one-time code:");
+        println!("  {}", device.user_code.bold());
+        println!(
+            "Continue only if you started this login in OpenShell. If another person or website gave you this code, cancel."
+        );
+        let browser_suppressed = no_open
+            || std::env::var("OPENSHELL_NO_BROWSER")
+                .ok()
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+        if !browser_suppressed
+            && let Err(error) = crate::auth::open_browser_url(&device.verification_url)
+        {
+            eprintln!("Could not open the browser automatically ({error}).");
+        }
+        println!("Waiting for OpenAI authorization...");
+        let grant = crate::codex_oauth::complete_device_code(device).await?;
+        let refresh_token = grant.refresh_token;
+        Ok(AttendedSubscriptionGrant {
+            material: HashMap::from([
+                ("refresh_token".to_string(), refresh_token.clone()),
+                ("account_id".to_string(), grant.account_id),
+                ("fedramp".to_string(), grant.fedramp.to_string()),
+            ]),
+            refresh_token,
+        })
+    }
+
+    async fn revoke_unclaimed_grant(&self, refresh_token: &str) -> Result<()> {
+        crate::codex_oauth::revoke_unclaimed_grant(refresh_token).await
+    }
+}
+
+#[tonic::async_trait]
+impl SubscriptionLoginAdapter for XaiGrokLoginAdapter {
+    fn spec(&self) -> &'static openshell_core::subscription_oauth::SubscriptionOauthSpec {
+        &openshell_core::subscription_oauth::XAI_GROK_SPEC
+    }
+
+    async fn attended_grant(&self, no_open: bool) -> Result<AttendedSubscriptionGrant> {
+        let grant = crate::xai_grok_oauth::run_device_code_login(no_open).await?;
+        let refresh_token = grant.refresh_token;
+        Ok(AttendedSubscriptionGrant {
+            material: HashMap::from([("refresh_token".to_string(), refresh_token.clone())]),
+            refresh_token,
+        })
+    }
+
+    async fn revoke_unclaimed_grant(&self, refresh_token: &str) -> Result<()> {
+        crate::xai_grok_oauth::revoke_unclaimed_grant(refresh_token).await
+    }
+}
+
+fn subscription_login_adapter(
+    provider: openshell_core::subscription_oauth::SubscriptionOauthProvider,
+) -> &'static dyn SubscriptionLoginAdapter {
+    match provider {
+        openshell_core::subscription_oauth::SubscriptionOauthProvider::OpenAiCodex => {
+            &OPENAI_CODEX_LOGIN_ADAPTER
+        }
+        openshell_core::subscription_oauth::SubscriptionOauthProvider::XaiGrok => {
+            &XAI_GROK_LOGIN_ADAPTER
+        }
+    }
+}
+
+async fn cleanup_failed_subscription_login(
+    client: &mut crate::tls::GrpcClient,
+    adapter: &'static dyn SubscriptionLoginAdapter,
+    provider_name: &str,
+    workspace: &str,
+    created_provider: bool,
+    refresh_token: &str,
+    expected_refresh_generation_id: Option<&str>,
+) -> Vec<&'static str> {
+    let spec = adapter.spec();
+    let mut failures = Vec::new();
+    let mut gateway_cleanup_complete = false;
+    if let Some(expected_refresh_generation_id) = expected_refresh_generation_id {
+        match client
+            .delete_provider_refresh(DeleteProviderRefreshRequest {
+                provider: provider_name.to_string(),
+                credential_key: spec.access_token_key.to_string(),
+                workspace: workspace.to_string(),
+                revoke_remote: true,
+                clear_credential: true,
+                expected_refresh_generation_id: expected_refresh_generation_id.to_string(),
+            })
+            .await
+        {
+            Ok(response) => {
+                let response = response.into_inner();
+                if response.deleted && response.remote_revoked && response.credential_cleared {
+                    gateway_cleanup_complete = true;
+                } else {
+                    failures.push("gateway grant cleanup reconciliation");
+                }
+            }
+            Err(_) => failures.push("gateway current-grant cleanup"),
+        }
+    } else if created_provider {
+        // Configure failed before returning the refresh-state identity. Its
+        // outcome is ambiguous, so never revoke or delete gateway state by
+        // provider name alone: a concurrent login may now own that name.
+        failures.push("provider retained for identity-safe cleanup");
+    }
+
+    // Always revoke the newly attended grant as well. When the gateway already
+    // rotated it, the authority returns an idempotent invalid-token response; when
+    // configure failed before persistence, this is the only remote authority.
+    if adapter.revoke_unclaimed_grant(refresh_token).await.is_err() {
+        failures.push("new grant revocation");
+    }
+
+    if created_provider
+        && gateway_cleanup_complete
+        && client
+            .delete_provider(DeleteProviderRequest {
+                name: provider_name.to_string(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .is_err()
+    {
+        failures.push("provider cleanup");
+    } else if created_provider && !gateway_cleanup_complete {
+        failures.push("provider retained for retryable cleanup");
+    }
+    failures
+}
+
+/// Create or re-authorize a gateway-managed subscription OAuth provider.
+///
+/// This intentionally starts a new attended grant and never imports another
+/// client's credentials. The refresh token crosses the CLI/gateway boundary
+/// once through a secret protobuf field, then remains gateway-managed.
+pub async fn provider_subscription_login(
+    server: &str,
+    provider_type: &str,
+    name: &str,
+    no_open: bool,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let spec = openshell_core::subscription_oauth::spec_for_provider_type(provider_type)
+        .ok_or_else(|| miette!("unsupported subscription provider type '{provider_type}'"))?;
+    let login_adapter = subscription_login_adapter(spec.provider);
+    let provider_name = name.trim();
+    if provider_name.is_empty() {
+        return Err(miette!("provider name is required"));
+    }
+    let mut client = grpc_client(server, tls).await?;
+
+    let existing_provider = match client
+        .get_provider(GetProviderRequest {
+            name: provider_name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+    {
+        Ok(response) => Some(
+            response
+                .into_inner()
+                .provider
+                .ok_or_else(|| miette!("provider missing from response"))?,
+        ),
+        Err(status) if status.code() == Code::NotFound => None,
+        Err(status) => return Err(status).into_diagnostic(),
+    };
+    if let Some(provider) = &existing_provider
+        && openshell_core::subscription_oauth::normalize_provider_type(&provider.r#type)
+            != Some(spec.provider_type)
+    {
+        return Err(miette!(
+            "provider '{provider_name}' already exists with type '{}'; choose another name",
+            provider.r#type
+        ));
+    }
+
+    if existing_provider.is_some() {
+        let statuses = client
+            .get_provider_refresh_status(GetProviderRefreshStatusRequest {
+                provider: provider_name.to_string(),
+                credential_key: spec.access_token_key.to_string(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .credentials;
+        if statuses
+            .iter()
+            .any(|status| status.status != "reauth_required")
+        {
+            return Err(miette!(
+                "provider '{provider_name}' already has a subscription grant; log out before replacing an active or indeterminate grant"
+            ));
+        }
+    }
+
+    let grant = login_adapter.attended_grant(no_open).await?;
+
+    let created_provider = if existing_provider.is_none() {
+        let create_result = client
+            .create_provider(CreateProviderRequest {
+                provider: Some(Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: provider_name.to_string(),
+                        created_at_ms: 0,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                        annotations: HashMap::new(),
+                        workspace: workspace.to_string(),
+                        deletion_timestamp_ms: 0,
+                    }),
+                    r#type: spec.provider_type.to_string(),
+                    credentials: HashMap::new(),
+                    config: HashMap::new(),
+                    credential_expires_at_ms: HashMap::new(),
+                    profile_workspace: workspace.to_string(),
+                    credential_handles: HashMap::new(),
+                }),
+                workspace: workspace.to_string(),
+            })
+            .await;
+        if let Err(status) = create_result {
+            let cleanup_failed = login_adapter
+                .revoke_unclaimed_grant(&grant.refresh_token)
+                .await
+                .is_err();
+            let cleanup = if cleanup_failed {
+                " The unused grant could not be revoked automatically; revoke it in the provider account security settings."
+            } else {
+                " The unused grant was revoked."
+            };
+            return Err(miette!(
+                "could not create {} subscription provider '{provider_name}': {status}.{cleanup}",
+                spec.display_name
+            ));
+        }
+        true
+    } else {
+        false
+    };
+
+    let configure_result = client
+        .configure_provider_refresh(ConfigureProviderRefreshRequest {
+            provider: provider_name.to_string(),
+            credential_key: spec.access_token_key.to_string(),
+            strategy: spec.strategy as i32,
+            material: grant.material,
+            secret_material_keys: spec
+                .secret_material_keys
+                .iter()
+                .map(|key| (*key).to_string())
+                .collect(),
+            expires_at_ms: None,
+            workspace: workspace.to_string(),
+        })
+        .await;
+    let configured_refresh_generation_id = match configure_result {
+        Ok(response) => response
+            .into_inner()
+            .status
+            .map(|status| status.refresh_generation_id)
+            .filter(|id| !id.is_empty()),
+        Err(status) => {
+            let cleanup = cleanup_failed_subscription_login(
+                &mut client,
+                login_adapter,
+                provider_name,
+                workspace,
+                created_provider,
+                &grant.refresh_token,
+                None,
+            )
+            .await;
+            let suffix = if cleanup.is_empty() {
+                " Cleanup completed.".to_string()
+            } else {
+                format!(
+                    " Cleanup was incomplete ({}). If the provider still has a grant, run 'openshell provider logout --name {provider_name}'; otherwise revoke the unused grant in the provider account security settings before retrying.",
+                    cleanup.join(", ")
+                )
+            };
+            return Err(miette!(
+                "could not configure {} subscription provider '{provider_name}': {status}.{suffix}",
+                spec.display_name
+            ));
+        }
+    };
+    let Some(configured_refresh_generation_id) = configured_refresh_generation_id else {
+        let cleanup = cleanup_failed_subscription_login(
+            &mut client,
+            login_adapter,
+            provider_name,
+            workspace,
+            created_provider,
+            &grant.refresh_token,
+            None,
+        )
+        .await;
+        return Err(miette!(
+            "could not configure {} subscription provider '{provider_name}': the gateway returned no refresh-state identity. Cleanup was conservative ({}).",
+            spec.display_name,
+            cleanup.join(", ")
+        ));
+    };
+
+    let rotate_result = client
+        .rotate_provider_credential(RotateProviderCredentialRequest {
+            provider: provider_name.to_string(),
+            credential_key: spec.access_token_key.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await;
+    let rotate_failure = match rotate_result {
+        Ok(response) => match response.into_inner().status {
+            Some(status)
+                if status.last_error.is_empty()
+                    && status.status == "refreshed"
+                    && status.expires_at_ms > chrono::Utc::now().timestamp_millis() =>
+            {
+                None
+            }
+            Some(_) => Some("the gateway did not mint a usable, unexpired credential".to_string()),
+            None => Some("the gateway returned no refresh status".to_string()),
+        },
+        Err(status) => Some(status.to_string()),
+    };
+    if let Some(reason) = rotate_failure {
+        let cleanup = cleanup_failed_subscription_login(
+            &mut client,
+            login_adapter,
+            provider_name,
+            workspace,
+            created_provider,
+            &grant.refresh_token,
+            Some(&configured_refresh_generation_id),
+        )
+        .await;
+        let suffix = if cleanup.is_empty() {
+            " Cleanup completed.".to_string()
+        } else {
+            format!(
+                " Cleanup was incomplete ({}). If the provider still has a grant, run 'openshell provider logout --name {provider_name}'; otherwise revoke the unused grant in the provider account security settings before retrying.",
+                cleanup.join(", ")
+            )
+        };
+        return Err(miette!(
+            "could not activate {} subscription provider '{provider_name}': {reason}.{suffix}",
+            spec.display_name
+        ));
+    }
+
+    println!(
+        "{} Signed in provider {} with a separate gateway-managed {} subscription grant",
+        "✓".green().bold(),
+        provider_name,
+        spec.display_name
+    );
+    println!(
+        "Attach it to an authorized sandbox and select its provider/model explicitly for inference.local."
+    );
+    if let Some(default_model) = spec.default_model {
+        println!(
+            "First reviewed model for this adapter: {default_model} (still select it explicitly per sandbox)."
+        );
+    }
+    Ok(())
+}
+
+pub async fn provider_subscription_logout(
+    server: &str,
+    expected_provider_type: Option<&str>,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let provider_name = name.trim();
+    if provider_name.is_empty() {
+        return Err(miette!("provider name is required"));
+    }
+    let mut client = grpc_client(server, tls).await?;
+    let provider = client
+        .get_provider(GetProviderRequest {
+            name: provider_name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .provider
+        .ok_or_else(|| miette!("provider missing from response"))?;
+    let spec = openshell_core::subscription_oauth::spec_for_provider_type(&provider.r#type)
+        .ok_or_else(|| {
+            miette!(
+                "provider '{provider_name}' is type '{}', not a subscription OAuth provider",
+                provider.r#type
+            )
+        })?;
+    if let Some(expected_provider_type) = expected_provider_type {
+        let expected =
+            openshell_core::subscription_oauth::spec_for_provider_type(expected_provider_type)
+                .ok_or_else(|| {
+                    miette!("unsupported subscription provider type '{expected_provider_type}'")
+                })?;
+        if expected.provider != spec.provider {
+            return Err(miette!(
+                "provider '{provider_name}' is type '{}', not the requested '{}'",
+                provider.r#type,
+                expected.provider_type
+            ));
+        }
+    }
+    let response = client
+        .delete_provider_refresh(DeleteProviderRefreshRequest {
+            provider: provider_name.to_string(),
+            credential_key: spec.access_token_key.to_string(),
+            workspace: workspace.to_string(),
+            revoke_remote: true,
+            clear_credential: true,
+            expected_refresh_generation_id: String::new(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    if !(response.deleted && response.remote_revoked && response.credential_cleared) {
+        return Err(miette!(
+            "subscription logout did not complete all revoke, state-delete, and credential-clear steps"
+        ));
+    }
+    println!(
+        "{} Revoked the {} grant and cleared the gateway credential for {}",
+        "✓".green().bold(),
+        spec.display_name,
+        provider_name
+    );
+    Ok(())
+}
+
 fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
     let (Ok(mut service_url), Ok(gateway_endpoint)) = (
         url::Url::parse(service_url),
@@ -4301,6 +4782,9 @@ pub async fn provider_refresh_delete(
             provider: name.to_string(),
             credential_key: credential_key.to_string(),
             workspace: workspace.to_string(),
+            revoke_remote: false,
+            clear_credential: false,
+            expected_refresh_generation_id: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -4361,6 +4845,8 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
+        ProviderCredentialRefreshStrategy::OpenaiCodexOauth => "openai_codex_oauth",
+        ProviderCredentialRefreshStrategy::XaiGrokOauth => "xai_grok_oauth",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -7409,6 +7895,7 @@ mod tests {
             last_refresh_at_ms: 1_767_225_000_000,
             last_error: "token endpoint returned a very long error message that should be truncated for table readability"
                 .to_string(),
+            refresh_generation_id: String::new(),
         });
 
         assert!(row.contains("my-graph"));

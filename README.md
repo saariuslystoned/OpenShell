@@ -137,7 +137,7 @@ Policies are declarative YAML files. Static sections (filesystem, process) are l
 
 ## Providers
 
-Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode, Copilot) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
+Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles made available through provider-specific runtime boundaries. Most profiles inject placeholders that the supervisor resolves at runtime; gateway-only inference profiles expose credentials only through `inference.local`. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode, Copilot) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never persist in the sandbox filesystem.
 
 ## GPU Support (Experimental)
 
@@ -174,6 +174,8 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 | `openshell sandbox connect [name]`                         | SSH into a running sandbox.                     |
 | `openshell sandbox list`                                   | List all sandboxes.                             |
 | `openshell provider create --type [type] --from-existing`  | Create a credential provider from env vars.     |
+| `openshell provider login --name codex-subscription`      | Create a separate gateway-managed Codex subscription grant. |
+| `openshell provider logout --name codex-subscription`     | Revoke and clear that subscription grant.       |
 | `openshell policy set <name> --policy file.yaml`           | Apply or update a policy on a running sandbox.  |
 | `openshell policy get <name>`                              | Show the active policy.                         |
 | `openshell inference set --provider <p> --model <m>`       | Configure the `inference.local` endpoint.       |

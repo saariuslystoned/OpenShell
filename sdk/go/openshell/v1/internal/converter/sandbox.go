@@ -46,10 +46,12 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 
 func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	result := types.SandboxSpec{
-		LogLevel:    spec.GetLogLevel(),
-		Environment: CopyStringMap(spec.GetEnvironment()),
-		Providers:   CopyStringSlice(spec.GetProviders()),
-		Policy:      SandboxPolicyFromProto(spec.GetPolicy()),
+		LogLevel:          spec.GetLogLevel(),
+		Environment:       CopyStringMap(spec.GetEnvironment()),
+		Providers:         CopyStringSlice(spec.GetProviders()),
+		InferenceProvider: spec.GetInferenceProvider(),
+		InferenceModel:    spec.GetInferenceModel(),
+		Policy:            SandboxPolicyFromProto(spec.GetPolicy()),
 	}
 
 	if tmpl := spec.GetTemplate(); tmpl != nil {
@@ -179,10 +181,12 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 	}
 
 	result := &pb.SandboxSpec{
-		LogLevel:    spec.LogLevel,
-		Environment: CopyStringMap(spec.Environment),
-		Providers:   CopyStringSlice(spec.Providers),
-		Policy:      SandboxPolicyToProto(spec.Policy),
+		LogLevel:          spec.LogLevel,
+		Environment:       CopyStringMap(spec.Environment),
+		Providers:         CopyStringSlice(spec.Providers),
+		InferenceProvider: spec.InferenceProvider,
+		InferenceModel:    spec.InferenceModel,
+		Policy:            SandboxPolicyToProto(spec.Policy),
 	}
 
 	if spec.Template != nil {

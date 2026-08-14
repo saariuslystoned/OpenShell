@@ -1,0 +1,126 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "xAI Grok Subscription"
+sidebar-title: "Grok Subscription"
+description: "Use a distinct xAI device grant for gateway-routed Grok subscription inference."
+keywords: "xAI, Grok, OAuth, Subscription, Inference, Gateway, OpenClaw"
+---
+
+<Warning>
+The `xai-grok-oauth` provider is experimental. Its public client, scopes,
+authorization endpoints, and first route surface are pinned to compatibility
+revision `2026-08-14.2` and may change when xAI changes those interfaces.
+</Warning>
+
+The xAI Grok subscription provider creates a distinct attended OAuth grant that
+OpenShell owns and stores at the gateway. It never reads or imports an OpenClaw,
+Grok CLI, browser, or host credential.
+
+The reusable refresh token remains gateway-only. A short-lived access token is
+available only to the trusted `inference.local` routing path for an explicitly
+attached sandbox. Neither token is injected into the sandbox environment.
+
+## Sign In
+
+Start a separate xAI device authorization:
+
+```shell
+openshell provider login \
+  --type grok-subscription \
+  --name grok-subscription
+```
+
+The CLI opens an xAI verification page, prints a one-time code, waits for the
+attended approval, and hands only the new refresh grant to the gateway. Use
+`--no-open` when the operator terminal cannot launch a browser.
+
+The authorization requests the reviewed `openid`, `profile`, `email`,
+`offline_access`, `api:access`, and `grok-cli:access` scopes. This is a
+least-privilege subset of the public Grok client at source revision
+`eb267feff13129e568df38fb6fdf0ceb65f735d6`: OpenShell does not request the
+conversation or workspace read/write scopes because its reviewed route does
+not use those APIs. Refresh omits `scope`, preserving the original grant rather
+than trying to add or narrow permissions. OAuth requests use pinned xAI
+authorities, reject redirects, cap response bodies, and return sanitized
+errors.
+
+An existing active or indeterminate grant is never overwritten. Log out first
+if you intend to replace it. Generic provider create, update, refresh, and
+delete commands cannot paste a bearer, redirect the xAI origin, substitute a
+generic refresh strategy, or orphan the managed grant.
+
+## Create a Sandbox with Explicit Selection
+
+Attach and select the provider while creating the sandbox:
+
+```shell
+openshell sandbox create \
+  --name grok-agent \
+  --provider grok-subscription \
+  --inference-provider grok-subscription \
+  --inference-model grok-4.6
+```
+
+`grok-4.6` is the first model recorded in this compatibility revision. Model
+selection remains explicit and sandbox-local; the model metadata is not an
+attachment-order default.
+
+The initial reviewed xAI surface is intentionally narrow:
+
+| Shape | Method | Sandbox path |
+|---|---|---|
+| Chat Completions | `POST` | `/v1/chat/completions` |
+| Model discovery | `GET` | `/v1/models` and `/v1/models/*` |
+
+The upstream origin is pinned to `https://api.x.ai/v1`. Provider config cannot
+override it. Responses, legacy completions, and embeddings are not advertised
+until they have separate end-to-end evidence.
+
+If both Codex and Grok providers are attached, `--inference-provider` and
+`--inference-model` select exactly one. OpenShell never chooses by attachment
+order and never falls through to the other subscription if the selected grant
+is expired, revoked, or otherwise unavailable.
+
+## Refresh, Failure, and Logout
+
+The gateway rotates the access token before expiry and retains a rotated xAI
+refresh token only in managed refresh state. It caps the local access lifetime
+at one hour. Terminal grant errors require a new attended sign-in; transient
+HTTP timeout, rate-limit, and server-error responses retain a sanitized retry
+record. If the Gateway loses a response after connecting, cannot read a
+successful response, or restarts after claiming a rotation but before recording
+its outcome, it treats the refresh token as possibly consumed and requires a
+new grant instead of risking token-family revocation by reusing the predecessor.
+
+Routes carry credential expiry. The gateway omits unusable grants, the
+supervisor evicts a cached subscription route when bundle refresh fails, and
+the local router checks expiry before every request.
+
+Log out symmetrically:
+
+```shell
+openshell provider logout \
+  --type grok-subscription \
+  --name grok-subscription
+```
+
+Logout fences rotation, revokes the refresh grant at the pinned xAI authority,
+and clears the gateway bearer and refresh state. If remote revocation fails,
+the locally usable bearer is still cleared while a `revoke_failed` refresh
+record retains the generation and refresh material needed for a deterministic
+retry. Repeating the logout is safe after either a partial or completed attempt.
+
+## Migration from the Grok Prototype
+
+The earlier Grok prototype used `provider create --login-xai-oauth`, stored a
+provider-level `XAI_GROK_MODEL`, and exposed a broader generic OpenAI-compatible
+route set. Migrate by logging out that prototype grant, using `provider login
+--type grok-subscription`, and moving provider/model choice to the paired
+sandbox create flags shown above. Do not import the prototype or OpenClaw
+refresh token.
+
+For shared and workspace-default inference behavior, refer to
+[Inference Routing](/sandboxes/inference-routing). For the other subscription
+adapter, refer to
+[OpenAI Codex Subscription](/providers/openai-codex-subscription).

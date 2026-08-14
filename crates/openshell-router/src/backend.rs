@@ -92,6 +92,11 @@ const COMMON_INFERENCE_REQUEST_HEADERS: [&str; 4] =
 /// and is intentionally omitted here.
 const VERTEX_UNSUPPORTED_BODY_FIELDS: &[&str] = &["context_management"];
 
+/// The `ChatGPT` Codex subscription backend rejects this otherwise-standard
+/// Responses parameter. Keep the rewrite route-scoped: API-key Responses
+/// providers may support and rely on the field.
+const OPENAI_CODEX_UNSUPPORTED_BODY_FIELDS: &[&str] = &["max_output_tokens"];
+
 impl StreamingProxyResponse {
     /// Create from a fully-buffered [`ProxyResponse`] (for mock routes).
     pub fn from_buffered(resp: ProxyResponse) -> Self {
@@ -150,12 +155,32 @@ fn sanitize_request_headers(
             if should_strip_request_header(&name_lc) || !allowed.contains(&name_lc) {
                 return None;
             }
+            // These Codex subscription headers are derived from the
+            // gateway-managed OAuth grant. A sandbox must never be able to
+            // substitute another account, FedRAMP mode, or client identity.
+            // Preserve the established caller-override behavior for ordinary
+            // defaults such as anthropic-version.
+            let gateway_owned_default = is_gateway_owned_default_header(&name_lc)
+                && route
+                    .default_headers
+                    .iter()
+                    .any(|(default_name, _)| default_name.eq_ignore_ascii_case(&name_lc));
+            if gateway_owned_default {
+                return None;
+            }
             if strip_anthropic_beta && name_lc == "anthropic-beta" {
                 return None;
             }
             Some((name.clone(), value.clone()))
         })
         .collect()
+}
+
+fn is_gateway_owned_default_header(name: &str) -> bool {
+    matches!(
+        name,
+        "chatgpt-account-id" | "x-openai-fedramp" | "originator"
+    )
 }
 
 fn should_strip_request_header(name: &str) -> bool {
@@ -178,6 +203,76 @@ fn is_hop_by_hop_header(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+fn is_openai_codex_subscription_route(route: &ResolvedRoute) -> bool {
+    route.endpoint.trim_end_matches('/')
+        == openshell_core::subscription_oauth::OPENAI_CODEX_INFERENCE_BASE_URL
+        && route
+            .protocols
+            .iter()
+            .any(|protocol| protocol == "openai_responses")
+        && route.request_path_override.as_deref() == Some("/responses")
+}
+
+fn rewrite_inference_request_body(
+    route: &ResolvedRoute,
+    body: bytes::Bytes,
+) -> Result<bytes::Bytes, RouterError> {
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return Ok(body);
+    };
+
+    if let Some(obj) = json.as_object_mut() {
+        // Vertex AI Anthropic endpoints require anthropic_version in the body.
+        // Standard Anthropic SDK sends it as a header; Vertex AI needs it as a body field.
+        // We inject it only for the Vertex rawPredict-style route contract used for
+        // Anthropic publisher endpoints, not for arbitrary model-in-path routes.
+        let needs_vertex_anthropic_version = is_vertex_anthropic_rawpredict_route(route);
+        if needs_vertex_anthropic_version {
+            // Vertex AI rawPredict encodes the model in the URL path, not
+            // the request body. Strip "model" and any Anthropic-SDK-only
+            // beta fields that Vertex's strict pydantic validation rejects.
+            obj.remove("model");
+            for field in VERTEX_UNSUPPORTED_BODY_FIELDS {
+                obj.remove(*field);
+            }
+        } else if route_is_bedrock(route) {
+            // AWS Bedrock InvokeModel encodes the model in the URL
+            // path; the request body is the raw provider-specific
+            // payload (e.g. an Anthropic Messages body for Claude
+            // models, a Mistral payload for Mistral models). The
+            // body must not be mutated — injecting a "model" field
+            // here would either be silently ignored or rejected as
+            // an unexpected key by the upstream / bridge.
+        } else {
+            obj.insert(
+                "model".to_string(),
+                serde_json::Value::String(route.model.clone()),
+            );
+        }
+
+        if is_openai_codex_subscription_route(route) {
+            for field in OPENAI_CODEX_UNSUPPORTED_BODY_FIELDS {
+                obj.remove(*field);
+            }
+        }
+
+        if needs_vertex_anthropic_version && !obj.contains_key("anthropic_version") {
+            obj.insert(
+                "anthropic_version".to_string(),
+                serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
+            );
+        }
+    }
+
+    Ok(bytes::Bytes::from(serde_json::to_vec(&json).map_err(
+        |err| {
+            RouterError::Internal(format!(
+                "failed to serialize rewritten inference request body: {err}"
+            ))
+        },
+    )?))
 }
 
 /// Build and send an HTTP request to the backend configured in `route`.
@@ -281,52 +376,7 @@ fn prepare_backend_request(
     //   path) and inject "anthropic_version" (required in the body, not a header).
     // Non-JSON bodies pass through unchanged; model rewrite and version injection
     // are silently skipped. Such bodies would be rejected by the upstream anyway.
-    let body = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(mut json) => {
-            if let Some(obj) = json.as_object_mut() {
-                // Vertex AI Anthropic endpoints require anthropic_version in the body.
-                // Standard Anthropic SDK sends it as a header; Vertex AI needs it as a body field.
-                // We inject it only for the Vertex rawPredict-style route contract used for
-                // Anthropic publisher endpoints, not for arbitrary model-in-path routes.
-                let needs_vertex_anthropic_version = is_vertex_anthropic_rawpredict_route(route);
-                if needs_vertex_anthropic_version {
-                    // Vertex AI rawPredict encodes the model in the URL path, not
-                    // the request body. Strip "model" and any Anthropic-SDK-only
-                    // beta fields that Vertex's strict pydantic validation rejects.
-                    obj.remove("model");
-                    for field in VERTEX_UNSUPPORTED_BODY_FIELDS {
-                        obj.remove(*field);
-                    }
-                } else if route_is_bedrock(route) {
-                    // AWS Bedrock InvokeModel encodes the model in the URL
-                    // path; the request body is the raw provider-specific
-                    // payload (e.g. an Anthropic Messages body for Claude
-                    // models, a Mistral payload for Mistral models). The
-                    // body must not be mutated — injecting a "model" field
-                    // here would either be silently ignored or rejected as
-                    // an unexpected key by the upstream / bridge.
-                } else {
-                    obj.insert(
-                        "model".to_string(),
-                        serde_json::Value::String(route.model.clone()),
-                    );
-                }
-                if needs_vertex_anthropic_version && !obj.contains_key("anthropic_version") {
-                    obj.insert(
-                        "anthropic_version".to_string(),
-                        serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
-                    );
-                }
-            }
-
-            bytes::Bytes::from(serde_json::to_vec(&json).map_err(|err| {
-                RouterError::Internal(format!(
-                    "failed to serialize rewritten inference request body: {err}"
-                ))
-            })?)
-        }
-        Err(_) => body,
-    };
+    let body = rewrite_inference_request_body(route, body)?;
     builder = builder.body(body);
 
     Ok((builder, url))
@@ -421,10 +471,20 @@ fn validation_probes(route: &ResolvedRoute) -> Vec<ValidationProbe> {
     }
 
     if has("openai_responses") {
+        let body = if is_openai_codex_subscription_route(route) {
+            // ChatGPT's Codex backend requires list-form Responses input and
+            // rejects max_output_tokens. Keep the probe stateless and within
+            // the exact route shape exercised by the official Codex client.
+            bytes::Bytes::from_static(
+                br#"{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"store":false,"stream":false}"#,
+            )
+        } else {
+            bytes::Bytes::from_static(br#"{"input":"ping","max_output_tokens":32}"#)
+        };
         probes.push(ValidationProbe {
             path: "/v1/responses",
             protocol: "openai_responses",
-            body: bytes::Bytes::from_static(br#"{"input":"ping","max_output_tokens":32}"#),
+            body,
             fallback_body: None,
         });
     }
@@ -1070,6 +1130,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         }
     }
 
@@ -1181,6 +1242,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         };
 
         let kept = super::sanitize_request_headers(
@@ -1251,6 +1313,108 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_request_headers_rejects_codex_gateway_owned_header_overrides() {
+        let mut route = test_route(
+            "https://chatgpt.com/backend-api/codex",
+            &["openai_responses"],
+            AuthHeader::Bearer,
+        );
+        route.default_headers = vec![
+            (
+                "ChatGPT-Account-ID".to_string(),
+                "account-owned".to_string(),
+            ),
+            ("X-OpenAI-FedRAMP".to_string(), "true".to_string()),
+            ("originator".to_string(), "openshell".to_string()),
+        ];
+        route.passthrough_headers.extend([
+            "chatgpt-account-id".to_string(),
+            "x-openai-fedramp".to_string(),
+            "originator".to_string(),
+        ]);
+
+        let kept = super::sanitize_request_headers(
+            &route,
+            &[
+                (
+                    "ChatGPT-Account-ID".to_string(),
+                    "account-hostile".to_string(),
+                ),
+                ("X-OpenAI-FedRAMP".to_string(), "false".to_string()),
+                ("originator".to_string(), "hostile-client".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            kept,
+            vec![("content-type".to_string(), "application/json".to_string())]
+        );
+    }
+
+    #[test]
+    fn codex_subscription_body_strips_unsupported_max_output_tokens() {
+        let mut route = test_route(
+            openshell_core::subscription_oauth::OPENAI_CODEX_INFERENCE_BASE_URL,
+            &["openai_responses"],
+            AuthHeader::Bearer,
+        );
+        route.request_path_override = Some("/responses".to_string());
+
+        let body = bytes::Bytes::from_static(
+            br#"{"model":"hostile-model","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":128,"store":false,"stream":true}"#,
+        );
+        let rewritten = super::rewrite_inference_request_body(&route, body).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        let object = json.as_object().unwrap();
+
+        assert_eq!(json["model"], "test-model");
+        assert!(!object.contains_key("max_output_tokens"));
+        assert!(object.contains_key("input"));
+        assert_eq!(json["store"], false);
+        assert_eq!(json["stream"], true);
+    }
+
+    #[test]
+    fn generic_responses_body_preserves_max_output_tokens() {
+        let route = test_route(
+            "https://api.openai.com/v1",
+            &["openai_responses"],
+            AuthHeader::Bearer,
+        );
+        let body = bytes::Bytes::from_static(
+            br#"{"model":"hostile-model","input":"ping","max_output_tokens":128}"#,
+        );
+        let rewritten = super::rewrite_inference_request_body(&route, body).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(json["model"], "test-model");
+        assert_eq!(json["max_output_tokens"], 128);
+    }
+
+    #[test]
+    fn codex_subscription_validation_probe_uses_supported_stateless_shape() {
+        let mut route = test_route(
+            openshell_core::subscription_oauth::OPENAI_CODEX_INFERENCE_BASE_URL,
+            &["openai_responses"],
+            AuthHeader::Bearer,
+        );
+        route.request_path_override = Some("/responses".to_string());
+
+        let probes = super::validation_probes(&route);
+        let probe = probes
+            .iter()
+            .find(|probe| probe.protocol == "openai_responses")
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&probe.body).unwrap();
+
+        assert!(json["input"].is_array());
+        assert!(json.get("max_output_tokens").is_none());
+        assert_eq!(json["store"], false);
+        assert_eq!(json["stream"], false);
+    }
+
+    #[test]
     fn vertex_anthropic_rawpredict_strips_anthropic_beta() {
         // Vertex AI rawPredict endpoints reject the anthropic-beta header.
         // The router must strip it before forwarding to avoid HTTP 400 errors
@@ -1268,6 +1432,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         let headers = vec![
@@ -1665,6 +1830,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -1704,6 +1870,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         let url = build_provider_url(&route, "claude-3-5-sonnet@20241022", "/v1/messages", false);
@@ -1733,6 +1900,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         let url = build_provider_url(&route, "claude-3-5-sonnet@20241022", "/v1/messages", true);
@@ -1758,6 +1926,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(String::new()),
+            credential_expires_at_ms: 0,
         };
 
         let url = build_provider_url(&route, "my-model", "/v1/messages", false);
@@ -1780,6 +1949,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: Some("/v1/chat/completions".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         let url = build_provider_url(&route, "some-model", "/v1/chat/completions", false);
@@ -1805,6 +1975,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         };
 
         let url = build_provider_url(&route, "gpt-4o", "/v1/chat/completions", false);
@@ -1830,6 +2001,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: Some("chat/completions".to_string()), // no leading slash
+            credential_expires_at_ms: 0,
         };
         let url = build_provider_url(&route, &route.model, "/v1/chat/completions", false);
         // Must not produce https://...openaichat/completions
@@ -1868,6 +2040,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -1940,6 +2113,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -2002,6 +2176,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -2070,6 +2245,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         };
 
         let client = reqwest::Client::builder().build().unwrap();
@@ -2143,6 +2319,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(":rawPredict".to_string()),
+            credential_expires_at_ms: 0,
         }];
 
         let body = serde_json::to_vec(&serde_json::json!({
@@ -2188,6 +2365,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -2250,6 +2428,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: true,
             request_path_override: Some(String::new()),
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))
@@ -2315,6 +2494,7 @@ mod tests {
             timeout: DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         };
 
         Mock::given(method("POST"))

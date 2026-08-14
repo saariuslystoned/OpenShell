@@ -810,6 +810,34 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
+    /// Sign in to an interactive subscription provider.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Login {
+        /// Subscription provider type (codex-subscription or grok-subscription).
+        #[arg(long = "type", default_value = "codex-subscription")]
+        provider_type: String,
+
+        /// Provider name to create or re-authorize.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Print the verification URL and code without opening a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+
+    /// Revoke an interactive subscription grant and clear its gateway credential.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Logout {
+        /// Optional subscription provider type to validate before logout.
+        #[arg(long = "type")]
+        provider_type: Option<String>,
+
+        /// Provider name to log out.
+        #[arg(long)]
+        name: Option<String>,
+    },
+
     /// Create a provider config.
     #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
@@ -1396,6 +1424,15 @@ enum SandboxCommands {
         /// the sandbox do not receive the real credential values. Repeatable.
         #[arg(long = "provider")]
         providers: Vec<String>,
+
+        /// Select this attached provider for inference.local in this sandbox.
+        /// Pair with --inference-model. Selection never depends on attachment order.
+        #[arg(long, requires = "inference_model")]
+        inference_provider: Option<String>,
+
+        /// Select this model for the sandbox-local inference provider.
+        #[arg(long, requires = "inference_provider")]
+        inference_model: Option<String>,
 
         /// Path to a custom sandbox policy YAML file.
         /// Overrides the built-in default and the `OPENSHELL_SANDBOX_POLICY` env var.
@@ -2971,6 +3008,8 @@ async fn run_async() -> Result<()> {
                     memory,
                     driver_config_json,
                     providers,
+                    inference_provider,
+                    inference_model,
                     policy,
                     forward,
                     tty,
@@ -3061,6 +3100,8 @@ async fn run_async() -> Result<()> {
                             driver_config_json: driver_config_json.as_deref(),
                             editor,
                             providers: &providers,
+                            inference_provider: inference_provider.as_deref(),
+                            inference_model: inference_model.as_deref(),
                             policy: policy.as_deref(),
                             forward,
                             command: &command,
@@ -3346,6 +3387,58 @@ async fn run_async() -> Result<()> {
             apply_auth(&mut tls, &ctx.name);
 
             match command {
+                ProviderCommands::Login {
+                    provider_type,
+                    name,
+                    no_open,
+                } => {
+                    let spec =
+                        openshell_core::subscription_oauth::spec_for_provider_type(&provider_type)
+                            .ok_or_else(|| {
+                                miette::miette!(
+                                    "unsupported subscription provider type '{provider_type}'"
+                                )
+                            })?;
+                    let name = name.unwrap_or_else(|| spec.default_instance_name.to_string());
+                    run::provider_subscription_login(
+                        endpoint,
+                        &provider_type,
+                        &name,
+                        no_open,
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
+                ProviderCommands::Logout {
+                    provider_type,
+                    name,
+                } => {
+                    let default_spec = provider_type
+                        .as_deref()
+                        .map(|provider_type| {
+                            openshell_core::subscription_oauth::spec_for_provider_type(
+                                provider_type,
+                            )
+                            .ok_or_else(|| {
+                                miette::miette!(
+                                    "unsupported subscription provider type '{provider_type}'"
+                                )
+                            })
+                        })
+                        .transpose()?
+                        .unwrap_or(&openshell_core::subscription_oauth::OPENAI_CODEX_SPEC);
+                    let name =
+                        name.unwrap_or_else(|| default_spec.default_instance_name.to_string());
+                    run::provider_subscription_logout(
+                        endpoint,
+                        provider_type.as_deref(),
+                        &name,
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
+                }
                 ProviderCommands::Create {
                     name,
                     provider_type,
@@ -4772,6 +4865,98 @@ mod tests {
     }
 
     #[test]
+    fn provider_codex_login_and_logout_parse_with_safe_defaults() {
+        let login = Cli::try_parse_from(["openshell", "provider", "login", "--no-open"])
+            .expect("Codex provider login should parse");
+        assert!(matches!(
+            login.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Login {
+                    provider_type,
+                    name,
+                    no_open,
+                })
+            }) if provider_type == "codex-subscription" && name.is_none() && no_open
+        ));
+
+        let logout = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "logout",
+            "--name",
+            "personal-codex",
+        ])
+        .expect("Codex provider logout should parse");
+        assert!(matches!(
+            logout.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Logout {
+                    provider_type,
+                    name,
+                })
+            }) if provider_type.is_none() && name.as_deref() == Some("personal-codex")
+        ));
+
+        let grok = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "login",
+            "--type",
+            "grok-subscription",
+            "--name",
+            "personal-grok",
+            "--no-open",
+        ])
+        .expect("Grok provider login should parse");
+        assert!(matches!(
+            grok.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Login {
+                    provider_type,
+                    name,
+                    no_open,
+                })
+            }) if provider_type == "grok-subscription"
+                && name.as_deref() == Some("personal-grok")
+                && no_open
+        ));
+
+        let grok_logout = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "logout",
+            "--type",
+            "grok-subscription",
+        ])
+        .expect("Grok provider logout should parse");
+        assert!(matches!(
+            grok_logout.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Logout {
+                    provider_type,
+                    name,
+                })
+            }) if provider_type.as_deref() == Some("grok-subscription") && name.is_none()
+        ));
+
+        let raw_refresh = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "configure",
+            "codex-subscription",
+            "--credential-key",
+            "OPENAI_CODEX_OAUTH_ACCESS_TOKEN",
+            "--strategy",
+            "openai-codex-oauth",
+        ]);
+        assert!(
+            raw_refresh.is_err(),
+            "Codex OAuth must use the attended provider login flow, not raw refresh material"
+        );
+    }
+
+    #[test]
     fn provider_refresh_commands_parse() {
         let status = Cli::try_parse_from([
             "openshell",
@@ -5227,6 +5412,56 @@ mod tests {
                 assert_eq!(command, vec!["claude".to_string()]);
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_inference_selection_is_paired_and_explicit() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--provider",
+            "grok-subscription",
+            "--inference-provider",
+            "grok-subscription",
+            "--inference-model",
+            "grok-4.6",
+        ])
+        .expect("paired sandbox inference selection should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create {
+                    inference_provider: Some(provider),
+                    inference_model: Some(model),
+                    ..
+                }),
+                ..
+            }) if provider == "grok-subscription" && model == "grok-4.6"
+        ));
+
+        for incomplete in [
+            vec![
+                "openshell",
+                "sandbox",
+                "create",
+                "--inference-provider",
+                "grok-subscription",
+            ],
+            vec![
+                "openshell",
+                "sandbox",
+                "create",
+                "--inference-model",
+                "grok-4.6",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(incomplete).is_err(),
+                "partial inference selection must fail at the CLI boundary"
+            );
         }
     }
 

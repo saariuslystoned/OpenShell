@@ -389,7 +389,9 @@ The following provider types are supported.
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
 | `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint. Set `--config OPENAI_BASE_URL` to point to the provider. Refer to [Inference Routing](/sandboxes/inference-routing). |
+| `openai-codex-oauth` | None | Experimental gateway-owned Sign in with ChatGPT grant. The access and refresh tokens are never injected. Refer to [OpenAI Codex Subscription](/providers/openai-codex-subscription). |
 | `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | OpenCode |
+| `xai-grok-oauth` | None | Experimental gateway-owned xAI Grok grant. The access and refresh tokens are never injected. Refer to [xAI Grok Subscription](/providers/xai-grok-subscription). |
 
 <Note>
 `ANTHROPIC_API_KEY` is an API key from [console.anthropic.com](https://console.anthropic.com), not a subscription token. Subscription users must generate a separate API key from the Anthropic Console.
@@ -408,6 +410,8 @@ The following providers have been tested with `inference.local`. Any provider th
 
 | Provider | Name | Type | Base URL | API Key Variable |
 |---|---|---|---|---|
+| OpenAI Codex subscription (experimental) | `codex-subscription` | `openai-codex-oauth` | Pinned Codex subscription backend | None; separate gateway-managed Sign in with ChatGPT grant |
+| xAI Grok subscription (experimental) | `grok-subscription` | `xai-grok-oauth` | `https://api.x.ai/v1` (pinned) | None; separate gateway-managed xAI device grant |
 | AWS Bedrock (via bridge) | `bedrock-bridge` | `aws-bedrock` | Operator-supplied `BEDROCK_BASE_URL` | None at router level (bridge holds creds) |
 | NVIDIA API Catalog | `nvidia-prod` | `nvidia` | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` |
 | Anthropic | `anthropic-prod` | `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
@@ -419,7 +423,7 @@ The following providers have been tested with `inference.local`. Any provider th
 | Ollama (local) | `ollama` | `openai` | `http://host.openshell.internal:11434/v1` | `OPENAI_API_KEY` |
 | LM Studio (local) | `lmstudio` | `openai` | `http://host.openshell.internal:1234/v1` | `OPENAI_API_KEY` |
 
-Refer to your provider's documentation for the correct base URL, available models, and API key setup. For the Vertex-specific auth flows and config keys, refer to [Google Vertex AI](/providers/google-vertex-ai). To configure inference routing, refer to [Inference Routing](/sandboxes/inference-routing).
+Refer to your provider's documentation for the correct base URL, available models, and API key setup. For gateway-managed personal grants, refer to [OpenAI Codex Subscription](/providers/openai-codex-subscription) and [xAI Grok Subscription](/providers/xai-grok-subscription). For the Vertex-specific auth flows and config keys, refer to [Google Vertex AI](/providers/google-vertex-ai). To configure inference routing, refer to [Inference Routing](/sandboxes/inference-routing).
 
 ## Next Steps
 

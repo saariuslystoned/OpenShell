@@ -70,7 +70,7 @@ impl Router {
         let normalized_source = source_protocol.trim().to_ascii_lowercase();
         let route = candidates
             .iter()
-            .find(|r| r.protocols.iter().any(|p| p == &normalized_source))
+            .find(|r| !r.is_expired() && r.protocols.iter().any(|p| p == &normalized_source))
             .ok_or_else(|| RouterError::NoCompatibleRoute(source_protocol.to_string()))?;
 
         info!(
@@ -114,7 +114,7 @@ impl Router {
         let normalized_source = source_protocol.trim().to_ascii_lowercase();
         let route = candidates
             .iter()
-            .find(|r| r.protocols.iter().any(|p| p == &normalized_source))
+            .find(|r| !r.is_expired() && r.protocols.iter().any(|p| p == &normalized_source))
             .ok_or_else(|| RouterError::NoCompatibleRoute(source_protocol.to_string()))?;
 
         info!(

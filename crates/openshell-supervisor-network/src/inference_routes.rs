@@ -14,6 +14,7 @@
 //!
 //! [`InferenceContext`]: crate::proxy::InferenceContext
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,6 +116,7 @@ pub async fn build_inference_context(
     // Captured during the initial cluster bundle fetch so the background refresh
     // loop can skip no-op updates from the very first tick.
     let mut initial_revision: Option<String> = None;
+    let mut initial_fail_closed_route_names = HashSet::new();
 
     let routes = match source {
         InferenceRouteSource::File => {
@@ -159,6 +161,7 @@ pub async fn build_inference_context(
             match openshell_core::grpc_client::fetch_inference_bundle(endpoint).await {
                 Ok(bundle) => {
                     initial_revision = Some(bundle.revision.clone());
+                    initial_fail_closed_route_names = fail_closed_route_names(&bundle);
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
@@ -272,6 +275,7 @@ pub async fn build_inference_context(
             endpoint.to_string(),
             route_refresh_interval_secs(),
             initial_revision,
+            initial_fail_closed_route_names,
         );
     }
 
@@ -308,8 +312,20 @@ pub fn bundle_to_resolved_routes(
         .routes
         .iter()
         .map(|r| {
-            let (auth, default_headers, passthrough_headers) =
+            let (auth, mut default_headers, passthrough_headers) =
                 openshell_core::inference::route_headers_for_provider_type(&r.provider_type);
+            let mut gateway_headers = r.default_headers.iter().collect::<Vec<_>>();
+            gateway_headers.sort_by(|left, right| left.0.cmp(right.0));
+            for (name, value) in gateway_headers {
+                if let Some(existing) = default_headers
+                    .iter_mut()
+                    .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                {
+                    existing.1.clone_from(value);
+                } else {
+                    default_headers.push((name.clone(), value.clone()));
+                }
+            }
             let timeout = if r.timeout_secs == 0 {
                 openshell_router::config::DEFAULT_ROUTE_TIMEOUT
             } else {
@@ -327,9 +343,41 @@ pub fn bundle_to_resolved_routes(
                 timeout,
                 model_in_path: r.model_in_path,
                 request_path_override: r.request_path_override.clone(),
+                credential_expires_at_ms: r.credential_expires_at_ms,
             }
         })
         .collect()
+}
+
+fn fail_closed_route_names(
+    bundle: &openshell_core::proto::GetInferenceBundleResponse,
+) -> HashSet<String> {
+    bundle
+        .routes
+        .iter()
+        .filter(|route| {
+            openshell_core::subscription_oauth::is_managed_provider_type(&route.provider_type)
+        })
+        .map(|route| route.name.clone())
+        .collect()
+}
+
+async fn remove_fail_closed_routes(
+    user_cache: &tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>,
+    system_cache: &tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>,
+    route_names: &HashSet<String>,
+) -> (usize, usize) {
+    let mut user_routes = user_cache.write().await;
+    let user_before = user_routes.len();
+    user_routes.retain(|route| !route_names.contains(&route.name));
+    let user_removed = user_before.saturating_sub(user_routes.len());
+    drop(user_routes);
+
+    let mut system_routes = system_cache.write().await;
+    let system_before = system_routes.len();
+    system_routes.retain(|route| !route_names.contains(&route.name));
+    let system_removed = system_before.saturating_sub(system_routes.len());
+    (user_removed, system_removed)
 }
 
 /// Spawn a background task that periodically refreshes both route caches from the gateway.
@@ -344,11 +392,14 @@ pub fn spawn_route_refresh(
     endpoint: String,
     interval_secs: u64,
     initial_revision: Option<String>,
+    initial_fail_closed_route_names: impl IntoIterator<Item = String>,
 ) {
+    let initial_fail_closed_route_names = initial_fail_closed_route_names.into_iter().collect();
     tokio::spawn(async move {
         use tokio::time::{MissedTickBehavior, interval};
 
         let mut current_revision = initial_revision;
+        let mut current_fail_closed_route_names = initial_fail_closed_route_names;
 
         let mut tick = interval(Duration::from_secs(interval_secs));
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -364,6 +415,7 @@ pub fn spawn_route_refresh(
                     }
 
                     let routes = bundle_to_resolved_routes(&bundle);
+                    let fail_closed_route_names = fail_closed_route_names(&bundle);
                     let (user_routes, system_routes) = partition_routes(routes);
                     ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
                         .severity(SeverityId::Informational)
@@ -380,17 +432,32 @@ pub fn spawn_route_refresh(
                         ))
                         .build());
                     current_revision = Some(bundle.revision);
+                    current_fail_closed_route_names = fail_closed_route_names;
                     *user_cache.write().await = user_routes;
                     *system_cache.write().await = system_routes;
                 }
                 Err(e) => {
+                    let (user_removed, system_removed) = remove_fail_closed_routes(
+                        user_cache.as_ref(),
+                        system_cache.as_ref(),
+                        &current_fail_closed_route_names,
+                    )
+                    .await;
+                    if user_removed > 0 || system_removed > 0 {
+                        // The next successful fetch must repopulate the routes
+                        // even when the gateway revision did not change while
+                        // it was unreachable.
+                        current_revision = None;
+                    }
                     ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
                         .state(StateId::Other, "stale")
+                        .unmapped("fail_closed_user_routes", serde_json::json!(user_removed))
+                        .unmapped("fail_closed_system_routes", serde_json::json!(system_removed))
                         .unmapped("error", serde_json::json!(e.to_string()))
                         .message(format!(
-                            "Failed to refresh inference route cache, keeping stale routes [error:{e}]"
+                            "Failed to refresh inference route cache; gateway-owned grant routes removed and remaining routes kept stale [fail_closed_user_routes:{user_removed} fail_closed_system_routes:{system_removed} error:{e}]"
                         ))
                         .build());
                 }
@@ -412,6 +479,74 @@ mod tests {
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    fn resolved_route(name: &str) -> openshell_router::config::ResolvedRoute {
+        openshell_router::config::ResolvedRoute {
+            name: name.to_string(),
+            endpoint: "https://example.test".to_string(),
+            model: "model".to_string(),
+            api_key: "credential".to_string(),
+            protocols: vec!["openai_responses".to_string()],
+            auth: openshell_core::inference::AuthHeader::Bearer,
+            default_headers: Vec::new(),
+            passthrough_headers: Vec::new(),
+            timeout: Duration::from_secs(60),
+            model_in_path: false,
+            request_path_override: None,
+            credential_expires_at_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_bundle_refresh_removes_only_gateway_owned_subscription_routes() {
+        let bundle = openshell_core::proto::GetInferenceBundleResponse {
+            routes: vec![
+                openshell_core::proto::ResolvedRoute {
+                    name: "codex-user".to_string(),
+                    provider_type: "codex-subscription".to_string(),
+                    ..Default::default()
+                },
+                openshell_core::proto::ResolvedRoute {
+                    name: "grok-user".to_string(),
+                    provider_type: "grok-subscription".to_string(),
+                    ..Default::default()
+                },
+                openshell_core::proto::ResolvedRoute {
+                    name: "ordinary".to_string(),
+                    provider_type: "openai".to_string(),
+                    ..Default::default()
+                },
+                openshell_core::proto::ResolvedRoute {
+                    name: SANDBOX_SYSTEM_ROUTE_NAME.to_string(),
+                    provider_type: "openai-codex-oauth".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let fail_closed = fail_closed_route_names(&bundle);
+        assert_eq!(
+            fail_closed,
+            HashSet::from([
+                "codex-user".to_string(),
+                "grok-user".to_string(),
+                SANDBOX_SYSTEM_ROUTE_NAME.to_string()
+            ])
+        );
+
+        let user_cache = tokio::sync::RwLock::new(vec![
+            resolved_route("codex-user"),
+            resolved_route("ordinary"),
+        ]);
+        let system_cache =
+            tokio::sync::RwLock::new(vec![resolved_route(SANDBOX_SYSTEM_ROUTE_NAME)]);
+        let removed = remove_fail_closed_routes(&user_cache, &system_cache, &fail_closed).await;
+
+        assert_eq!(removed, (1, 1));
+        assert_eq!(user_cache.read().await.len(), 1);
+        assert_eq!(user_cache.read().await[0].name, "ordinary");
+        assert!(system_cache.read().await.is_empty());
+    }
+
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {
         let bundle = openshell_core::proto::GetInferenceBundleResponse {
@@ -426,9 +561,11 @@ mod tests {
                         "openai_responses".to_string(),
                     ],
                     provider_type: "openai".to_string(),
+                    default_headers: std::collections::HashMap::new(),
                     timeout_secs: 0,
                     model_in_path: false,
                     request_path_override: None,
+                    credential_expires_at_ms: 0,
                 },
                 openshell_core::proto::ResolvedRoute {
                     name: "local".to_string(),
@@ -437,9 +574,11 @@ mod tests {
                     model_id: "llama-3".to_string(),
                     protocols: vec!["openai_chat_completions".to_string()],
                     provider_type: String::new(),
+                    default_headers: std::collections::HashMap::new(),
                     timeout_secs: 120,
                     model_in_path: false,
                     request_path_override: None,
+                    credential_expires_at_ms: 0,
                 },
             ],
             revision: "abc123".to_string(),
@@ -499,9 +638,11 @@ mod tests {
                 model_id: "model".to_string(),
                 protocols: vec!["openai_chat_completions".to_string()],
                 provider_type: "openai".to_string(),
+                default_headers: std::collections::HashMap::new(),
                 timeout_secs: 0,
                 model_in_path: false,
                 request_path_override: None,
+                credential_expires_at_ms: 0,
             }],
             revision: "rev".to_string(),
             generated_at_ms: 0,
@@ -526,6 +667,7 @@ mod tests {
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
                 model_in_path: false,
                 request_path_override: None,
+                credential_expires_at_ms: 0,
             },
             openshell_router::config::ResolvedRoute {
                 name: "sandbox-system".to_string(),
@@ -539,6 +681,7 @@ mod tests {
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
                 model_in_path: false,
                 request_path_override: None,
+                credential_expires_at_ms: 0,
             },
         ];
 
@@ -737,6 +880,7 @@ routes:
             timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             model_in_path: false,
             request_path_override: None,
+            credential_expires_at_ms: 0,
         }];
 
         let cache = Arc::new(RwLock::new(routes));

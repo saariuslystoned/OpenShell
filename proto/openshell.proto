@@ -807,6 +807,12 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+  // Optional sandbox-local inference provider selection. When set, this exact
+  // provider must also appear in `providers`; it overrides the workspace route
+  // for this sandbox without consulting attachment order.
+  string inference_provider = 12;
+  // Model paired with `inference_provider`. Both fields must be set together.
+  string inference_model = 13;
 }
 
 message ResourceRequirements {
@@ -1516,6 +1522,12 @@ enum ProviderCredentialRefreshStrategy {
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS = 4;
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT = 5;
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE = 6;
+  // OpenAI's public Codex/ChatGPT subscription OAuth refresh contract. The
+  // gateway pins the issuer/client and never accepts a caller-supplied token URL.
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OPENAI_CODEX_OAUTH = 7;
+  // xAI's experimental Grok subscription OAuth refresh contract. The gateway
+  // pins the issuer/client/scopes and never accepts caller-supplied authority.
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_XAI_GROK_OAUTH = 8;
 }
 
 message ProviderCredentialRefreshMaterial {
@@ -1554,6 +1566,10 @@ message ProviderCredentialRefreshStatus {
   int64 next_refresh_at_ms = 7;
   int64 last_refresh_at_ms = 8;
   string last_error = 9;
+  // Opaque identity of this configured grant generation. Clients may use it to
+  // fence cleanup after a multi-step grant operation without receiving secret
+  // material. It changes whenever configure replaces a refresh grant.
+  string refresh_generation_id = 10;
 }
 
 // Provider profile local discovery declaration.
@@ -1584,6 +1600,10 @@ message StoredProviderCredentialRefreshState {
   // collision reservation, and env-key surfacing so later profile edits cannot
   // silently redirect writes.
   map<string, string> additional_output_keys = 17;
+  // Non-secret generation fence rotated on every successful configure. This is
+  // distinct from metadata.id because a reauthorization updates the existing
+  // stored object while replacing the remote grant it represents.
+  string refresh_generation_id = 18;
 }
 
 message GetProviderRefreshStatusRequest {
@@ -1628,10 +1648,21 @@ message DeleteProviderRefreshRequest {
   string credential_key = 2;
   // Workspace scope. Empty defaults to "default".
   string workspace = 3;
+  // Revoke a supported OAuth grant at its pinned authority before deleting the
+  // local refresh state. Supported only by reviewed subscription OAuth
+  // strategies with pinned remote revocation authorities.
+  bool revoke_remote = 4;
+  // Remove the primary minted credential after successful revocation.
+  bool clear_credential = 5;
+  // Optional optimistic fence. When set, deletion/revocation proceeds only if
+  // the current refresh state has this exact configured-grant generation.
+  string expected_refresh_generation_id = 6;
 }
 
 message DeleteProviderRefreshResponse {
   bool deleted = 1;
+  bool remote_revoked = 2;
+  bool credential_cleared = 3;
 }
 
 // Stable provider profile categories used by clients for grouping and filtering.

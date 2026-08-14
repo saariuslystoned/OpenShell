@@ -21,11 +21,13 @@ type Sandbox struct {
 
 // SandboxSpec holds the desired state of a sandbox.
 type SandboxSpec struct {
-	LogLevel    string
-	Environment map[string]string
-	Template    *SandboxTemplate
-	Providers   []string
-	GPUCount    *uint32
+	LogLevel          string
+	Environment       map[string]string
+	Template          *SandboxTemplate
+	Providers         []string
+	GPUCount          *uint32
+	InferenceProvider string
+	InferenceModel    string
 	// Policy is the security policy for the sandbox. Nil means no policy specified.
 	Policy *SandboxPolicy
 }
