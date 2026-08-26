@@ -18,6 +18,8 @@ OpenShell is the safe, private runtime for autonomous AI agents. It provides san
 
 OpenShell is built agent-first. The project ships with agent skills for everything from gateway troubleshooting to policy generation, and we expect contributors to use them.
 
+Users of the `saariuslystoned` downstream should follow [SAARI_DOWNSTREAM.md](SAARI_DOWNSTREAM.md) for the maintained OpenShell/NemoClaw release pair, subscription-provider scope, and upgrade contract.
+
 > **Alpha software — single-player mode.** OpenShell is proof-of-life: one developer, one environment, one gateway. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Expect rough edges. Bring your agent.
 
 ## Quickstart
