@@ -14,8 +14,8 @@ channel.
 
 Use these two immutable tags together:
 
-- `saariuslystoned/OpenShell` at `v0.0.106-saari.1`
-- `saariuslystoned/NemoClaw` at `v0.0.114-saari.1`
+- `saariuslystoned/OpenShell` at `v0.0.106-saari.2`
+- `saariuslystoned/NemoClaw` at `v0.0.114-saari.8`
 
 Do not install this downstream from a moving `main`, `latest`, or feature
 branch. The paired NemoClaw release checks for the required OpenShell inference
@@ -32,15 +32,19 @@ It also normalizes Codex subscription responses, keeps route-cache behavior
 fail-closed, proves both subscription providers through OpenClaw, and isolates
 unbound static credentials from sandbox materialization.
 
+The gateway holds provider credentials, but it has no gateway-wide inference
+selection. Each sandbox receives its provider and model as a create-time route.
+The Codex proxy normalizes generic OpenAI Responses clients to the narrower
+subscription request schema while preserving streaming, tools, reasoning, and
+safe text options.
+
 The paired NemoClaw release owns these named sandbox roles:
 
-| Sandbox | Provider | Model |
-|---------|----------|-------|
-| FORGE | `codex-subscription` | `gpt-5.6-sol` |
-| RANGER | `codex-subscription` | `gpt-5.6-terra` |
-| SPARK | `grok-subscription` | `grok-4.6` |
-
-Nemotron is not an accepted route for those three role sandboxes.
+| Role | Live sandbox | Provider | Model |
+|------|--------------|----------|-------|
+| FORGE | `spark02-forge` | `codex-subscription` | `gpt-5.6-sol` |
+| RANGER | `spark02-ranger` | `codex-subscription` | `gpt-5.6-terra` |
+| SPARK | `spark02-assistant` | `grok-subscription` | `grok-4.6` |
 
 ## Upstream Update Contract
 

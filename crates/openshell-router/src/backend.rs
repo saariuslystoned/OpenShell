@@ -92,10 +92,17 @@ const COMMON_INFERENCE_REQUEST_HEADERS: [&str; 4] =
 /// and is intentionally omitted here.
 const VERTEX_UNSUPPORTED_BODY_FIELDS: &[&str] = &["context_management"];
 
-/// The `ChatGPT` Codex subscription backend rejects this otherwise-standard
-/// Responses parameter. Keep the rewrite route-scoped: API-key Responses
-/// providers may support and rely on the field.
-const OPENAI_CODEX_UNSUPPORTED_BODY_FIELDS: &[&str] = &["max_output_tokens"];
+/// The `ChatGPT` Codex subscription backend rejects these otherwise-standard
+/// Responses parameters. Keep the rewrite route-scoped: API-key Responses
+/// providers may support and rely on these fields.
+const OPENAI_CODEX_UNSUPPORTED_BODY_FIELDS: &[&str] = &[
+    "max_output_tokens",
+    "metadata",
+    "prompt_cache_retention",
+    "service_tier",
+    "temperature",
+    "top_p",
+];
 
 impl StreamingProxyResponse {
     /// Create from a fully-buffered [`ProxyResponse`] (for mock routes).
@@ -255,6 +262,16 @@ fn rewrite_inference_request_body(
         if is_openai_codex_subscription_route(route) {
             for field in OPENAI_CODEX_UNSUPPORTED_BODY_FIELDS {
                 obj.remove(*field);
+            }
+            let remove_text = obj
+                .get_mut("text")
+                .and_then(|value| value.as_object_mut())
+                .is_some_and(|text| {
+                    text.remove("format");
+                    text.is_empty()
+                });
+            if remove_text {
+                obj.remove("text");
             }
         }
 
@@ -476,7 +493,7 @@ fn validation_probes(route: &ResolvedRoute) -> Vec<ValidationProbe> {
             // rejects max_output_tokens. Keep the probe stateless and within
             // the exact route shape exercised by the official Codex client.
             bytes::Bytes::from_static(
-                br#"{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"store":false,"stream":false}"#,
+                br#"{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"store":false,"stream":true}"#,
             )
         } else {
             bytes::Bytes::from_static(br#"{"input":"ping","max_output_tokens":32}"#)
@@ -1041,9 +1058,9 @@ fn is_vertex_anthropic_rawpredict_route(route: &ResolvedRoute) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ValidationFailure, ValidationFailureKind, build_backend_url, build_provider_url,
-        parse_bedrock_invocation_path, prepare_backend_request, rewrite_bedrock_path,
-        route_is_bedrock, verify_backend_endpoint,
+        OPENAI_CODEX_UNSUPPORTED_BODY_FIELDS, ValidationFailure, ValidationFailureKind,
+        build_backend_url, build_provider_url, parse_bedrock_invocation_path,
+        prepare_backend_request, rewrite_bedrock_path, route_is_bedrock, verify_backend_endpoint,
     };
     use crate::RouterError;
     use crate::config::{DEFAULT_ROUTE_TIMEOUT, ResolvedRoute};
@@ -1353,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_subscription_body_strips_unsupported_max_output_tokens() {
+    fn codex_subscription_body_strips_unsupported_responses_fields() {
         let mut route = test_route(
             openshell_core::subscription_oauth::OPENAI_CODEX_INFERENCE_BASE_URL,
             &["openai_responses"],
@@ -1362,14 +1379,18 @@ mod tests {
         route.request_path_override = Some("/responses".to_string());
 
         let body = bytes::Bytes::from_static(
-            br#"{"model":"hostile-model","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":128,"store":false,"stream":true}"#,
+            br#"{"model":"hostile-model","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":128,"metadata":{"source":"client"},"prompt_cache_retention":"24h","service_tier":"auto","temperature":1.0,"top_p":0.9,"text":{"format":{"type":"text"},"verbosity":"low"},"store":false,"stream":true}"#,
         );
         let rewritten = super::rewrite_inference_request_body(&route, body).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
         let object = json.as_object().unwrap();
 
         assert_eq!(json["model"], "test-model");
-        assert!(!object.contains_key("max_output_tokens"));
+        for field in OPENAI_CODEX_UNSUPPORTED_BODY_FIELDS {
+            assert!(!object.contains_key(*field));
+        }
+        assert!(json["text"].get("format").is_none());
+        assert_eq!(json["text"]["verbosity"], "low");
         assert!(object.contains_key("input"));
         assert_eq!(json["store"], false);
         assert_eq!(json["stream"], true);
@@ -1411,7 +1432,7 @@ mod tests {
         assert!(json["input"].is_array());
         assert!(json.get("max_output_tokens").is_none());
         assert_eq!(json["store"], false);
-        assert_eq!(json["stream"], false);
+        assert_eq!(json["stream"], true);
     }
 
     #[test]
